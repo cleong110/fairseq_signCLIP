@@ -1,16 +1,22 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'    # Suppress TensorFlow C++ backend logs
-os.environ['GLOG_minloglevel'] = '3'          # Suppress GLOG messages from XLA/CUDA
+import itertools
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow C++ backend logs
+os.environ["GLOG_minloglevel"] = "3"  # Suppress GLOG messages from XLA/CUDA
 
 import warnings
 # warnings.filterwarnings("ignore")           # Suppress Python warnings
 
 import logging
-logging.getLogger('tensorflow').setLevel(logging.ERROR)  # Suppress TensorFlow Python logs
+
+logging.getLogger("tensorflow").setLevel(
+    logging.ERROR
+)  # Suppress TensorFlow Python logs
 
 # Optionally, if using Hugging Face Transformers, you can suppress its logs too:
 try:
     from transformers import logging as hf_logging
+
     hf_logging.set_verbosity_error()
 except ImportError:
     pass
@@ -21,6 +27,7 @@ import torch
 import numpy as np
 from pose_format import Pose
 from mmpt.models import MMPTModel
+import matplotlib.pyplot as plt
 
 # import mediapipe as mp
 # mp_holistic = mp.solutions.holistic
@@ -28,24 +35,147 @@ from mmpt.models import MMPTModel
 
 # To avoid installing mediapipe, we just hardcode the face contours given the above code
 FACEMESH_CONTOURS_POINTS = [
-    '0', '7', '10', '13', '14', '17', '21', '33', '37', '39', '40', '46', '52', '53', '54', '55', '58', '61', '63',
-    '65', '66', '67', '70', '78', '80', '81', '82', '84', '87', '88', '91', '93', '95', '103', '105', '107', '109',
-    '127', '132', '133', '136', '144', '145', '146', '148', '149', '150', '152', '153', '154', '155', '157', '158',
-    '159', '160', '161', '162', '163', '172', '173', '176', '178', '181', '185', '191', '234', '246', '249', '251',
-    '263', '267', '269', '270', '276', '282', '283', '284', '285', '288', '291', '293', '295', '296', '297', '300',
-    '308', '310', '311', '312', '314', '317', '318', '321', '323', '324', '332', '334', '336', '338', '356', '361',
-    '362', '365', '373', '374', '375', '377', '378', '379', '380', '381', '382', '384', '385', '386', '387', '388',
-    '389', '390', '397', '398', '400', '402', '405', '409', '415', '454', '466'
+    "0",
+    "7",
+    "10",
+    "13",
+    "14",
+    "17",
+    "21",
+    "33",
+    "37",
+    "39",
+    "40",
+    "46",
+    "52",
+    "53",
+    "54",
+    "55",
+    "58",
+    "61",
+    "63",
+    "65",
+    "66",
+    "67",
+    "70",
+    "78",
+    "80",
+    "81",
+    "82",
+    "84",
+    "87",
+    "88",
+    "91",
+    "93",
+    "95",
+    "103",
+    "105",
+    "107",
+    "109",
+    "127",
+    "132",
+    "133",
+    "136",
+    "144",
+    "145",
+    "146",
+    "148",
+    "149",
+    "150",
+    "152",
+    "153",
+    "154",
+    "155",
+    "157",
+    "158",
+    "159",
+    "160",
+    "161",
+    "162",
+    "163",
+    "172",
+    "173",
+    "176",
+    "178",
+    "181",
+    "185",
+    "191",
+    "234",
+    "246",
+    "249",
+    "251",
+    "263",
+    "267",
+    "269",
+    "270",
+    "276",
+    "282",
+    "283",
+    "284",
+    "285",
+    "288",
+    "291",
+    "293",
+    "295",
+    "296",
+    "297",
+    "300",
+    "308",
+    "310",
+    "311",
+    "312",
+    "314",
+    "317",
+    "318",
+    "321",
+    "323",
+    "324",
+    "332",
+    "334",
+    "336",
+    "338",
+    "356",
+    "361",
+    "362",
+    "365",
+    "373",
+    "374",
+    "375",
+    "377",
+    "378",
+    "379",
+    "380",
+    "381",
+    "382",
+    "384",
+    "385",
+    "386",
+    "387",
+    "388",
+    "389",
+    "390",
+    "397",
+    "398",
+    "400",
+    "402",
+    "405",
+    "409",
+    "415",
+    "454",
+    "466",
 ]
 
 MAX_FRAMES_DEFAULT = 256  # Default truncate length, can be overridden
 
 # Model configurations (keep these unchanged)
 model_configs = [
-    ("default", "signclip_v1_1/baseline_temporal"), # multilingual pretrained
-    ("asl_citizen", "signclip_asl/asl_citizen_finetune"), # fine-tuned on ASL Citizen
-    ("asl_finetune", "signclip_asl/asl_finetune"), # fine-tuned on three ASL datasets
-    ("suisse", "signclip_suisse/suisse_finetune"), # fine-tuned on Signsuisse
+    # ("default", "signclip_v1_1/baseline_temporal"), # multilingual pretrained
+    ("default", "semantic-search/embed_with_asl_finetune_checkpoint_best"),
+    # ("asl_finetune_checkpoint_best",
+    #     "semantic-search/embed_with_asl_finetune_checkpoint_best"),
+    # ("asl_citizen", "signclip_asl/asl_citizen_finetune"), # fine-tuned on ASL Citizen
+    # ("asl_finetune", "signclip_asl/asl_finetune"), # fine-tuned on three ASL datasets
+    # ("suisse", "signclip_suisse/suisse_finetune"), # fine-tuned on Signsuisse
     # below are config files for longer duration inference and absuluate checkpoint path
     # ("default", "signclip_v1_1/baseline_temporal_inference"), # multilingual pretrained
     # ("suisse", "signclip_suisse/suisse_finetune_inference"), # fine-tuned on Signsuisse
@@ -53,6 +183,7 @@ model_configs = [
 
 # Cache for models that have been lazily initialized.
 models = {}
+
 
 def get_model(model_name):
     """
@@ -94,18 +225,24 @@ def get_model(model_name):
 
 def pose_normalization_info(pose_header):
     if pose_header.components[0].name == "POSE_LANDMARKS":
-        return pose_header.normalization_info(p1=("POSE_LANDMARKS", "RIGHT_SHOULDER"),
-                                              p2=("POSE_LANDMARKS", "LEFT_SHOULDER"))
+        return pose_header.normalization_info(
+            p1=("POSE_LANDMARKS", "RIGHT_SHOULDER"),
+            p2=("POSE_LANDMARKS", "LEFT_SHOULDER"),
+        )
 
     if pose_header.components[0].name == "BODY_135":
-        return pose_header.normalization_info(p1=("BODY_135", "RShoulder"),
-                                              p2=("BODY_135", "LShoulder"))
+        return pose_header.normalization_info(
+            p1=("BODY_135", "RShoulder"), p2=("BODY_135", "LShoulder")
+        )
 
     if pose_header.components[0].name == "pose_keypoints_2d":
-        return pose_header.normalization_info(p1=("pose_keypoints_2d", "RShoulder"),
-                                              p2=("pose_keypoints_2d", "LShoulder"))
-    
-    raise ValueError(f"Could not parse normalization info, pose_header.components[0].name is {pose_header.components[0].name}. Expected one of (POSE_LANDMARKS,BODY_135,pose_keypoints_2d)")
+        return pose_header.normalization_info(
+            p1=("pose_keypoints_2d", "RShoulder"), p2=("pose_keypoints_2d", "LShoulder")
+        )
+
+    raise ValueError(
+        f"Could not parse normalization info, pose_header.components[0].name is {pose_header.components[0].name}. Expected one of (POSE_LANDMARKS,BODY_135,pose_keypoints_2d)"
+    )
 
 
 def pose_hide_legs(pose):
@@ -125,7 +262,12 @@ def pose_hide_legs(pose):
 
 def preprocess_pose(pose, max_frames=None):
     pose = pose.get_components(
-        ["POSE_LANDMARKS", "FACE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"],
+        [
+            "POSE_LANDMARKS",
+            "FACE_LANDMARKS",
+            "LEFT_HAND_LANDMARKS",
+            "RIGHT_HAND_LANDMARKS",
+        ],
         {"FACE_LANDMARKS": FACEMESH_CONTOURS_POINTS},
     )
 
@@ -135,9 +277,13 @@ def preprocess_pose(pose, max_frames=None):
     feat = np.nan_to_num(pose.body.data)
     feat = feat.reshape(feat.shape[0], -1)
 
-    pose_frames = torch.from_numpy(np.expand_dims(feat, axis=0)).float()  # e.g., torch.Size([1, frame count, 609])
+    pose_frames = torch.from_numpy(
+        np.expand_dims(feat, axis=0)
+    ).float()  # e.g., torch.Size([1, frame count, 609])
     if max_frames is not None and pose_frames.size(1) > max_frames:
-        print(f"pose sequence length too long ({pose_frames.size(1)}) longer than {max_frames} frames. Truncating")
+        print(
+            f"pose sequence length too long ({pose_frames.size(1)}) longer than {max_frames} frames. Truncating"
+        )
         pose_frames = pose_frames[:, :max_frames, :]
 
     return pose_frames
@@ -156,11 +302,11 @@ def preprocess_text(text, model_name="default"):
     return caps, cmasks
 
 
-def embed_pose(pose, model_name='default'):
+def embed_pose(pose, model_name="default"):
     model_info = get_model(model_name)
-    model = model_info['model']
+    model = model_info["model"]
 
-    caps, cmasks = preprocess_text('', model_name)
+    caps, cmasks = preprocess_text("", model_name)
     poses = pose if type(pose) == list else [pose]
     embeddings = []
 
@@ -189,23 +335,25 @@ def embed_pose(pose, model_name='default'):
     batch_size = len(poses)
 
     with torch.no_grad():
-        output = model(pose_frames_l,
-                       caps.repeat(batch_size, 1),
-                       cmasks.repeat(batch_size, 1),
-                       return_score=False)
-        embeddings.append(output['pooled_video'].cpu().numpy())
+        output = model(
+            pose_frames_l,
+            caps.repeat(batch_size, 1),
+            cmasks.repeat(batch_size, 1),
+            return_score=False,
+        )
+        embeddings.append(output["pooled_video"].cpu().numpy())
 
     return np.concatenate(embeddings)
 
 
-def embed_text(text, model_name='default'):
+def embed_text(text, model_name="default"):
     model_info = get_model(model_name)
-    model = model_info['model']
-    
+    model = model_info["model"]
+
     # Determine the placeholder dimension based on the model_name.
-    if model_name == 'lip':
+    if model_name == "lip":
         placeholder_dim = 1377
-    elif model_name == 'lip_only':
+    elif model_name == "lip_only":
         placeholder_dim = 768
     else:
         placeholder_dim = 609
@@ -219,7 +367,7 @@ def embed_text(text, model_name='default'):
     cmasks_list = []
     for t in texts:
         caps, cmasks = preprocess_text(t, model_name)
-        caps_list.append(caps)   # Each should have shape (1, 128)
+        caps_list.append(caps)  # Each should have shape (1, 128)
         cmasks_list.append(cmasks)
 
     # Concatenate the individual results along the batch dimension.
@@ -232,9 +380,9 @@ def embed_text(text, model_name='default'):
     # Run the model forward pass only once with the full batch.
     with torch.no_grad():
         output = model(pose_frames, caps_batch, cmasks_batch, return_score=False)
-    
+
     # Extract the pooled text embeddings and return as a NumPy array.
-    embeddings = output['pooled_text'].cpu().numpy()
+    embeddings = output["pooled_text"].cpu().numpy()
     return embeddings
 
 
@@ -251,7 +399,7 @@ def score_pose_and_text(pose, text, model_name="default", max_frames=None):
     return text, float(output["score"])  # dot-product
 
 
-def score_pose_and_text_batch(pose, text, model_name='default'):
+def score_pose_and_text_batch(pose, text, model_name="default"):
     pose_embedding = embed_pose(pose, model_name)
     text_embedding = embed_text(text, model_name)
 
@@ -259,8 +407,32 @@ def score_pose_and_text_batch(pose, text, model_name='default'):
     return scores
 
 
+def load_pose(
+    pose_path: Path, start_time_ms: int | None = None, end_time_ms: int | None = None
+) -> Pose:
+    """
+    Loads a pose file and optionally slices it by time.
+
+    Parameters:
+        pose_path: Path to the `.pose` file.
+        start_time_ms: Optional start time in milliseconds.
+        end_time_ms: Optional end time in milliseconds.
+
+    Returns:
+        A Pose object sliced by the specified time range.
+    """
+    if not pose_path.is_file():
+        raise FileNotFoundError(f"Pose file not found: {pose_path}")
+
+    with open(pose_path, "rb") as f:
+        buffer = f.read()
+        return Pose.read(buffer, start_time=start_time_ms, end_time=end_time_ms)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate pose and text similarity using SignCLIP.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate pose and text similarity using SignCLIP."
+    )
     parser.add_argument(
         "--pose_path",
         default="./house.pose",
@@ -275,34 +447,132 @@ def main():
         default=None,
         help=f"If provided, pose sequences longer than this will be truncated, otherwise they will not. If provided without a value, will use {MAX_FRAMES_DEFAULT}, as SignCLIP can currently only support this many. If provided with a value, will use that value",
     )
+    parser.add_argument(
+        "--start_time_ms",
+        type=int,
+        default=None,
+        help="Optional start time (in ms) to slice the pose.",
+    )
+    parser.add_argument(
+        "--end_time_ms",
+        type=int,
+        default=None,
+        help="Optional end time (in ms) to slice the pose.",
+    )
+
+    parser.add_argument(
+        "--window_size_ms",
+        type=int,
+        default=None,
+        help="Steps for slicing the pose",
+    )
+
+    parser.add_argument(
+        "--eng",
+        type=str,
+        default="god",
+        help="English word(s) to look for, (comma-separated)",
+    )
 
     args = parser.parse_args()
 
     pose_path = args.pose_path
     max_frames = args.max_frames
 
+    scores = []
+
     if not pose_path.is_file():
         print(f"Error: File {pose_path} does not exist.")
         return
+    # Define sliding window parameters
+    window_size_ms = args.window_size_ms
 
-    with open(pose_path, "rb") as f:
-        buffer = f.read()
-        pose = Pose.read(buffer)
+    if window_size_ms is None:
+        window_sizes = list(range(100, 1000, 100))
+    else:
+        window_sizes = [window_size_ms]
 
-        print(score_pose_and_text(pose, "random text", max_frames=max_frames))
-        print(score_pose_and_text(pose, "house", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <ase> house", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <gsg> house", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <fsl> house", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <ase> sun", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <ase> police", max_frames=max_frames))
-        print(score_pose_and_text(pose, "<en> <ase> how are you?", max_frames=max_frames))
+    eng_words = args.eng.split(",")
 
-        text_l = ["<en> <ase> house", "<en> <ase> police"]
-        pose_l = [pose, pose]
-        print(score_pose_and_text_batch(pose_l, text_l))
-        
-        print(score_pose_and_text_batch(pose_l, text_l, model_name='asl_finetune'))
+    for eng, window_size_ms in itertools.product(eng_words, window_sizes):
+        start_ms = args.start_time_ms or 0
+
+        # If end_time is not specified, load full pose once to get total duration
+        if args.end_time_ms is None:
+            full_pose = load_pose(args.pose_path)
+            duration_ms = int(
+                full_pose.body.fps
+                * 1000
+                * full_pose.body.data.shape[0]
+                / full_pose.body.fps
+            )
+            end_ms = duration_ms
+        else:
+            end_ms = args.end_time_ms
+
+        print(f"Sliding from {start_ms}ms to {end_ms}ms with step={window_size_ms}ms")
+        god_scores = []  # List of tuples: (window_start_ms, window_end_ms, score)
+
+        for window_start in range(start_ms, end_ms, window_size_ms):
+            window_end = min(window_start + window_size_ms, end_ms)
+
+            try:
+                pose = load_pose(
+                    args.pose_path, start_time_ms=window_start, end_time_ms=window_end
+                )
+            except Exception as e:
+                print(f"Failed to load window {window_start}-{window_end}ms: {e}")
+                continue
+
+            # print(f"\nWindow {window_start}-{window_end}ms:")
+            # print(f"Pose shape: {pose.body.data.shape}")
+
+            try:
+                # print(score_pose_and_text(pose, "random text", max_frames=args.max_frames))
+                # print(score_pose_and_text(pose, "god", max_frames=args.max_frames))
+                # print(score_pose_and_text(pose, "<en> <ase> god", max_frames=args.max_frames)
+                # print(score_pose_and_text(pose, "<en> <ase> god", max_frames=args.max_frames))
+                # print(score_pose_and_text(pose, "<en> <ase> sun", max_frames=args.max_frames))
+                # print(score_pose_and_text(pose, "<en> <ase> police", max_frames=args.max_frames))
+                # print(score_pose_and_text(pose, "<en> <ase> how are you?", max_frames=args.max_frames))
+                text = f"<en> <ase> {eng}"
+                _, score = score_pose_and_text(pose, text, max_frames=args.max_frames)
+                print((text, score))
+                god_scores.append((window_start, window_end, score))
+
+            except Exception as e:
+                print(f"Scoring failed for window {window_start}-{window_end}ms: {e}")
+
+        print(god_scores)
+        window_starts = [start for start, _, _ in god_scores]
+        scores = [score for _, _, score in god_scores]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(window_starts, scores, marker='o', linestyle='-')
+        plt.title(f"Score of '<en> <ase> {eng}' over Sliding Windows, step={window_size_ms}ms")
+        plt.xlabel("Window Start Time (ms)")
+        plt.ylabel("Score")
+        plt.grid(True)
+        plt.tight_layout()
+
+        out_dir = Path(__file__).parent.resolve() /"search_plots"
+        subfolder = out_dir/f"{eng}"/f"{start_ms}_to_{end_ms}_step{window_size_ms}"
+        subfolder.mkdir(exist_ok=True, parents=True)
+        out = subfolder/f"{eng}_scores_{start_ms}_to_{end_ms}_step{window_size_ms}.png"
+        plt.savefig(out)
+        print(out.resolve())
+        # plt.show()
+
+
+
+        # text_l = ["<en> <ase> house",
+        # "<en> <ase> home",
+        # "<en> <ase> police"
+        # ]
+        # pose_l = [pose, pose]
+        # print(score_pose_and_text_batch(pose_l, text_l))
+
+        # print(score_pose_and_text_batch(pose_l, text_l, model_name='asl_finetune'))
 
 
 if __name__ == "__main__":
