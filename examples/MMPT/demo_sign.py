@@ -1,17 +1,30 @@
+from collections import defaultdict
+import argparse
+from pathlib import Path
+import torch
+import numpy as np
+import pandas as pd
+from pose_format import Pose
+from mmpt.models import MMPTModel
+import matplotlib.pyplot as plt
+
 import os
-import itertools
+from tqdm import tqdm
+from functools import cache
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow C++ backend logs
 os.environ["GLOG_minloglevel"] = "3"  # Suppress GLOG messages from XLA/CUDA
 
-import warnings
+# import warnings
 # warnings.filterwarnings("ignore")           # Suppress Python warnings
 
 import logging
 
+
 logging.getLogger("tensorflow").setLevel(
     logging.ERROR
 )  # Suppress TensorFlow Python logs
+
 
 # Optionally, if using Hugging Face Transformers, you can suppress its logs too:
 try:
@@ -21,13 +34,7 @@ try:
 except ImportError:
     pass
 
-import argparse
-from pathlib import Path
-import torch
-import numpy as np
-from pose_format import Pose
-from mmpt.models import MMPTModel
-import matplotlib.pyplot as plt
+SignCLIPEmbeddable = Pose | str
 
 # import mediapipe as mp
 # mp_holistic = mp.solutions.holistic
@@ -171,8 +178,14 @@ MAX_FRAMES_DEFAULT = 256  # Default truncate length, can be overridden
 model_configs = [
     # ("default", "signclip_v1_1/baseline_temporal"), # multilingual pretrained
     ("default", "semantic-search/embed_with_asl_finetune_checkpoint_best"),
-    # ("asl_finetune_checkpoint_best",
-    #     "semantic-search/embed_with_asl_finetune_checkpoint_best"),
+    (
+        "asl_finetune_checkpoint_best",
+        "semantic-search/embed_with_asl_finetune_checkpoint_best",
+    ),
+    # size mismatch for video_encoder.bert.embeddings.word_embeddings.weight: copying a param with shape torch.Size([28996, 768]) from checkpoint, the shape in current model is torch.Size([30522, 768]).
+    # ("asl_finetune_checkpoint_best_uncased",
+    #     "semantic-search/embed_with_asl_finetune_checkpoint_best_and_bert_uncased"),
+    ("baseline_temporal", "semantic-search/embed_with_baseline_temporal"),
     # ("asl_citizen", "signclip_asl/asl_citizen_finetune"), # fine-tuned on ASL Citizen
     # ("asl_finetune", "signclip_asl/asl_finetune"), # fine-tuned on three ASL datasets
     # ("suisse", "signclip_suisse/suisse_finetune"), # fine-tuned on Signsuisse
@@ -182,7 +195,7 @@ model_configs = [
 ]
 
 # Cache for models that have been lazily initialized.
-models = {}
+models_cache = {}
 
 
 def get_model(model_name):
@@ -191,8 +204,8 @@ def get_model(model_name):
     If the model is already loaded, return it.
     Otherwise, find its config, load it, and cache it.
     """
-    if model_name in models:
-        return models[model_name]
+    if model_name in models_cache:
+        return models_cache[model_name]
 
     # Look up the configuration for the given model_name.
     config_path = None
@@ -215,12 +228,12 @@ def get_model(model_name):
     if torch.cuda.is_available():
         model.cuda()
 
-    models[model_name] = {
+    models_cache[model_name] = {
         "model": model,
         "tokenizer": tokenizer,
         "aligner": aligner,
     }
-    return models[model_name]
+    return models_cache[model_name]
 
 
 def pose_normalization_info(pose_header):
@@ -307,7 +320,7 @@ def embed_pose(pose, model_name="default"):
     model = model_info["model"]
 
     caps, cmasks = preprocess_text("", model_name)
-    poses = pose if type(pose) == list else [pose]
+    poses = pose if isinstance(pose, list) else [pose]
     embeddings = []
 
     pose_frames_l = []
@@ -407,6 +420,23 @@ def score_pose_and_text_batch(pose, text, model_name="default"):
     return scores
 
 
+@cache
+def embed_either_format(input_item: SignCLIPEmbeddable):
+    if isinstance(input_item, str):
+        return embed_text(f"<en> <ase> {input_item}")
+    elif isinstance(input_item, Pose):
+        return embed_pose(input_item)
+
+
+def score_either_format(query: SignCLIPEmbeddable, target: SignCLIPEmbeddable):
+    query_embed = embed_either_format(query)
+    second_embed = embed_either_format(target)
+    score = np.matmul(query_embed, second_embed.T).squeeze()
+    # print(f"Types! {type(query_embed)}, {type(second_embed)}")
+    # print(f"Shapes! {query_embed.shape}, {second_embed.shape}")
+    return float(score)
+
+
 def load_pose(
     pose_path: Path, start_time_ms: int | None = None, end_time_ms: int | None = None
 ) -> Pose:
@@ -427,6 +457,70 @@ def load_pose(
     with open(pose_path, "rb") as f:
         buffer = f.read()
         return Pose.read(buffer, start_time=start_time_ms, end_time=end_time_ms)
+
+
+def get_sliding_window_frame_ranges(
+    max: int,
+    window_length: int = 1000,
+    stride: int = 500,
+    start: int = 0,
+    end: int | None = None,
+) -> list[tuple[int, int]]:
+    end = end if end is not None else max
+
+    if end > max:
+        raise ValueError(f"End index {end} exceeds max length {max}")
+    if window_length <= 0 or stride <= 0:
+        raise ValueError("window_length and stride must be > 0")
+
+    ranges = []
+    i = start
+    while i < end:
+        window_end = min(i + window_length, end)
+        ranges.append((i, window_end))
+        if window_end == end:
+            break
+        i += stride
+    return ranges
+
+
+def score_windows_over_pose(
+    pose_path,
+    query: SignCLIPEmbeddable,
+    start_ms,
+    end_ms,
+    window_size_ms,
+    step_size_ms,
+    model_name,
+):
+    """
+    Slide a window over the pose file and score each window using a precomputed query embedding.
+
+    Returns:
+        List of tuples: (window_start_ms, window_end_ms, score)
+    """
+    query_scores = defaultdict(list)
+
+    for window_start, window_end in tqdm(get_sliding_window_frame_ranges(
+        max=end_ms,
+        window_length=window_size_ms,
+        stride=step_size_ms,
+        start=start_ms,
+        end=end_ms,
+    ), desc="sliding over windows"):
+        # window_end = min(window_start + window_size_ms, end_ms)
+        pose = load_pose(
+            pose_path=pose_path, start_time_ms=window_start, end_time_ms=window_end
+        )
+        # print(window_start, window_end)
+        score = score_either_format(pose, query)
+        query_scores["window_start_ms"].append(window_start)
+        query_scores["window_midpoint_ms"].append((window_start + window_end) // 2)
+        query_scores["window_end_ms"].append(window_end)
+        query_scores["score"].append(score)
+        # query_scores.append((window_start, window_end, score))
+
+    return pd.DataFrame(query_scores)
 
 
 def main():
@@ -459,11 +553,17 @@ def main():
         default=None,
         help="Optional end time (in ms) to slice the pose.",
     )
-
+    # God called the light day and the darkness He called night
     parser.add_argument(
         "--window_size_ms",
         type=int,
-        default=None,
+        default=1000,
+        help="window length for pose slicing",
+    )
+    parser.add_argument(
+        "--step_size_ms",
+        type=int,
+        default=500,
         help="Steps for slicing the pose",
     )
 
@@ -474,12 +574,26 @@ def main():
         help="English word(s) to look for, (comma-separated)",
     )
 
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="default",
+        # choices=[str(key) for key, _ in model_configs],
+        help="Model to use (comma-separated)",
+    )
+
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path(__file__).parent / "results",
+        help="Model to use",
+    )
+
     args = parser.parse_args()
 
     pose_path = args.pose_path
-    max_frames = args.max_frames
 
-    scores = []
+    print(args.models)
 
     if not pose_path.is_file():
         print(f"Error: File {pose_path} does not exist.")
@@ -487,93 +601,88 @@ def main():
     # Define sliding window parameters
     window_size_ms = args.window_size_ms
 
-    if window_size_ms is None:
-        window_sizes = list(range(100, 1000, 100))
-    else:
-        window_sizes = [window_size_ms]
+    step_size_ms = args.step_size_ms
 
-    eng_words = args.eng.split(",")
+    queries = args.eng.split(",")
+    # queries = [f"<en> <ase> {q}" for q in queries]
 
-    for eng, window_size_ms in itertools.product(eng_words, window_sizes):
-        start_ms = args.start_time_ms or 0
+    models_to_use = args.models.split(",")
 
-        # If end_time is not specified, load full pose once to get total duration
-        if args.end_time_ms is None:
-            full_pose = load_pose(args.pose_path)
-            duration_ms = int(
-                full_pose.body.fps
-                * 1000
-                * full_pose.body.data.shape[0]
-                / full_pose.body.fps
+    print(models_to_use)
+    for q in queries:
+        print(f"Query: {q}")
+
+    full_pose = load_pose(pose_path)
+    duration_ms = int(
+        full_pose.body.fps * 1000 * full_pose.body.data.shape[0] / full_pose.body.fps
+    )
+
+    for model_to_use in models_to_use:
+        print(f"Loading model {model_to_use}")
+        run_dir = args.results_dir / model_to_use / pose_path.stem
+        queries_dir = run_dir / "queries"
+
+        for query in queries:
+            start_ms = args.start_time_ms or 0
+            print(f"Query: {query}")
+
+            if args.end_time_ms is None:
+                end_ms = duration_ms
+            else:
+                end_ms = args.end_time_ms
+
+            query_dir = queries_dir / f"{query}"
+            query_dir.mkdir(exist_ok=True, parents=True)
+
+            out = (
+                query_dir
+                / f"{query}_scores_{start_ms}_to_{end_ms}_step{window_size_ms}.png"
             )
-            end_ms = duration_ms
-        else:
-            end_ms = args.end_time_ms
+            # if out.is_file():
+            #     print(f"{out} exists: Skipping!")
+            #     continue
 
-        print(f"Sliding from {start_ms}ms to {end_ms}ms with step={window_size_ms}ms")
-        god_scores = []  # List of tuples: (window_start_ms, window_end_ms, score)
+            print(
+                f"Sliding from {start_ms}ms to {end_ms}ms with step={step_size_ms}ms, window_size {window_size_ms}"
+            )
+            # query_scores = []  # List of tuples: (window_start_ms, window_end_ms, score) scor
+            query_scores_df = score_windows_over_pose(
+                pose_path,
+                query=query,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                window_size_ms=window_size_ms,
+                model_name=model_to_use,
+                step_size_ms=step_size_ms,
+            )
+            query_scores_df["query"] = query
 
-        for window_start in range(start_ms, end_ms, window_size_ms):
-            window_end = min(window_start + window_size_ms, end_ms)
+            # window_starts = [start for start, _, _ in eng_query_scores]
+            window_midpoints = query_scores_df["window_midpoint_ms"].tolist()
+            scores = query_scores_df["score"].tolist()
+            # scores = [score for _, _, score in query_scores]
 
-            try:
-                pose = load_pose(
-                    args.pose_path, start_time_ms=window_start, end_time_ms=window_end
-                )
-            except Exception as e:
-                print(f"Failed to load window {window_start}-{window_end}ms: {e}")
-                continue
+            plt.figure(figsize=(10, 5))
+            plt.plot(window_midpoints, scores, marker="o", linestyle="-")
+            plt.title(
+                f"Score of '{query}' over Sliding Windows, step={step_size_ms}ms, size={window_size_ms}"
+            )
+            plt.xlabel("Window Midpoint Time (ms)")
+            plt.ylabel("Score")
+            plt.grid(True)
+            plt.tight_layout()
 
-            # print(f"\nWindow {window_start}-{window_end}ms:")
-            # print(f"Pose shape: {pose.body.data.shape}")
+            plt.savefig(out)
+            print(out.resolve())
 
-            try:
-                # print(score_pose_and_text(pose, "random text", max_frames=args.max_frames))
-                # print(score_pose_and_text(pose, "god", max_frames=args.max_frames))
-                # print(score_pose_and_text(pose, "<en> <ase> god", max_frames=args.max_frames)
-                # print(score_pose_and_text(pose, "<en> <ase> god", max_frames=args.max_frames))
-                # print(score_pose_and_text(pose, "<en> <ase> sun", max_frames=args.max_frames))
-                # print(score_pose_and_text(pose, "<en> <ase> police", max_frames=args.max_frames))
-                # print(score_pose_and_text(pose, "<en> <ase> how are you?", max_frames=args.max_frames))
-                text = f"<en> <ase> {eng}"
-                _, score = score_pose_and_text(pose, text, max_frames=args.max_frames)
-                print((text, score))
-                god_scores.append((window_start, window_end, score))
-
-            except Exception as e:
-                print(f"Scoring failed for window {window_start}-{window_end}ms: {e}")
-
-        print(god_scores)
-        window_starts = [start for start, _, _ in god_scores]
-        scores = [score for _, _, score in god_scores]
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(window_starts, scores, marker='o', linestyle='-')
-        plt.title(f"Score of '<en> <ase> {eng}' over Sliding Windows, step={window_size_ms}ms")
-        plt.xlabel("Window Start Time (ms)")
-        plt.ylabel("Score")
-        plt.grid(True)
-        plt.tight_layout()
-
-        out_dir = Path(__file__).parent.resolve() /"search_plots"
-        subfolder = out_dir/f"{eng}"/f"{start_ms}_to_{end_ms}_step{window_size_ms}"
-        subfolder.mkdir(exist_ok=True, parents=True)
-        out = subfolder/f"{eng}_scores_{start_ms}_to_{end_ms}_step{window_size_ms}.png"
-        plt.savefig(out)
-        print(out.resolve())
-        # plt.show()
-
-
-
-        # text_l = ["<en> <ase> house",
-        # "<en> <ase> home",
-        # "<en> <ase> police"
-        # ]
-        # pose_l = [pose, pose]
-        # print(score_pose_and_text_batch(pose_l, text_l))
-
-        # print(score_pose_and_text_batch(pose_l, text_l, model_name='asl_finetune'))
+            scores_out = query_dir / "scores.parquet"
+            print(query_scores_df.head())
+            print(query_scores_df.info())
+            print(query_scores_df.describe())
+            query_scores_df.to_parquet(scores_out)
+            print(scores_out.resolve())
 
 
 if __name__ == "__main__":
     main()
+# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/demo_sign.py --pose_path "/opt/home/cleong/projects/semantic_and_visual_similarity/sign-bibles-dataset/samples/CBT-001-ase-2-Intro _ God Creates the World.pose" --start_time_ms 0 --end_time_ms 60000 --step_size_ms 500 --eng "God,GOD,god,star,day,earth,life,heaven" --models "asl_finetune_checkpoint_best"
