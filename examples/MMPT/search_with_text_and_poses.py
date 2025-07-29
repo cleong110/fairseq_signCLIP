@@ -8,6 +8,7 @@ from pose_format import Pose
 from mmpt.models import MMPTModel
 import matplotlib.pyplot as plt
 import uuid
+import time
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sign_language_gloss_utils.glosses.gloss_utils import get_dataset_vocab
@@ -16,6 +17,7 @@ from sign_language_gloss_utils.glosses.text_utils import (
     get_glosses_set_from_text,
     preprocess_text,
 )
+from contextlib import contextmanager
 
 import os
 from tqdm import tqdm
@@ -42,6 +44,22 @@ try:
     hf_logging.set_verbosity_error()
 except ImportError:
     pass
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def timed_section(name: str):
+    start = time.perf_counter()
+    result = {}
+    yield result
+    end = time.perf_counter()
+    duration = end - start
+    result["duration"] = duration
+    logger.info(f"[TIMER] {name} took {duration:.2f} seconds.")
+
 
 SignCLIPEmbeddable = Pose | str | Path
 
@@ -225,10 +243,10 @@ def get_model(model_name):
 
     if config_path is None:
         raise ValueError(f"Unknown model name: {model_name}")
-
+    file_dir = Path(__file__).parent.resolve()
     # Load the model, tokenizer, and aligner.
     model, tokenizer, aligner = MMPTModel.from_pretrained(
-        f"projects/retri/{config_path}.yaml",
+        file_dir / f"projects/retri/{config_path}.yaml",
         # f"/home/zifjia/fairseq/examples/MMPT/projects/retri/{config_path}.yaml",
         video_encoder=None,
     )
@@ -368,6 +386,7 @@ def embed_pose(pose, model_name="default"):
     return np.concatenate(embeddings)
 
 
+@cache
 def embed_text(text, model_name="default"):
     model_info = get_model(model_name)
     model = model_info["model"]
@@ -430,7 +449,7 @@ def score_pose_and_text_batch(pose, text, model_name="default"):
 
 
 @cache
-def embed_either_format(input_item: SignCLIPEmbeddable):
+def embed_either_format(input_item: SignCLIPEmbeddable) -> np.ndarray:
     if isinstance(input_item, Path):
         return embed_pose(Pose.read(input_item.read_bytes()))
     if isinstance(input_item, str):
@@ -445,6 +464,7 @@ def score_either_format(query: SignCLIPEmbeddable, target: SignCLIPEmbeddable):
     score = np.matmul(query_embed, second_embed.T).squeeze()
     # print(f"Types! {type(query_embed)}, {type(second_embed)}")
     # print(f"Shapes! {query_embed.shape}, {second_embed.shape}")
+    # exit()
     return float(score)
 
 
@@ -466,8 +486,18 @@ def load_pose(
         raise FileNotFoundError(f"Pose file not found: {pose_path}")
 
     with open(pose_path, "rb") as f:
-        buffer = f.read()
-        return Pose.read(buffer, start_time=start_time_ms, end_time=end_time_ms)
+        return Pose.read(f, start_time=start_time_ms, end_time=end_time_ms)
+
+
+@cache
+def load_window_embedding(
+    pose_path: Path, start_time_ms: int | None = None, end_time_ms: int | None = None
+):
+    return embed_pose(
+        load_pose(
+            pose_path=pose_path, start_time_ms=start_time_ms, end_time_ms=end_time_ms
+        )
+    )
 
 
 def get_sliding_window_frame_ranges(
@@ -511,6 +541,7 @@ def score_windows_over_pose(
         List of tuples: (window_start_ms, window_end_ms, score)
     """
     query_scores = defaultdict(list)
+    query_embed = embed_either_format(query)
 
     for window_start, window_end in tqdm(
         get_sliding_window_frame_ranges(
@@ -523,11 +554,20 @@ def score_windows_over_pose(
         desc="sliding over windows",
     ):
         # window_end = min(window_start + window_size_ms, end_ms)
-        pose = load_pose(
+        # with timed_section(f"Load Target Pose Window")
+        # pose = load_pose(
+        #     pose_path=pose_path, start_time_ms=window_start, end_time_ms=window_end
+        # )
+        # pose = load_pose(
+        #     pose_path=pose_path, start_time_ms=window_start, end_time_ms=window_end
+        # )
+        pose_embedding = load_window_embedding(
             pose_path=pose_path, start_time_ms=window_start, end_time_ms=window_end
         )
-        # print(window_start, window_end)
-        score = score_either_format(pose, query)
+        # print(type(pose_embedding))
+
+        score = float(np.matmul(query_embed, pose_embedding.T).squeeze())
+
         query_scores["window_start_ms"].append(window_start)
         query_scores["window_midpoint_ms"].append((window_start + window_end) // 2)
         query_scores["window_end_ms"].append(window_end)
@@ -552,19 +592,25 @@ def get_pose_queries(query_glosses, dataset_df, samples_per_gloss=5):
         query_value = Path(pose_path)
         yield query_label, query_id, query_value
 
+
 def get_text_queries(query_glosses):
     text_queries = []
     for gloss in query_glosses:
-        query_label = gloss
-        query_id = f"{gloss} (eng)"
-        query_value = gloss.lower()
-        text_queries.append((query_label, query_id, query_value))
+        for transform in ["upper", "lower", "capitalize"]:
+            query_label = gloss
+
+            if transform == "capitalize":
+                query_value = gloss.capitalize()
+            elif transform == "lower":
+                query_value = gloss.lower()
+            else:
+                query_value = gloss.upper()
+
+            query_id = f"{query_value} (eng)"
+
+            text_queries.append((query_label, query_id, query_value))
 
     return text_queries
-
-
-
-
 
 
 def main():
@@ -675,11 +721,9 @@ def main():
     for q in queries:
         print(q)
 
-
     full_pose = load_pose(pose_path)
-    duration_ms = int(
-        full_pose.body.fps * 1000 * full_pose.body.data.shape[0] / full_pose.body.fps
-    )
+    duration_ms = 1000 * len(full_pose.body.data) / full_pose.body.fps
+
 
     model_to_use = args.model
 
@@ -693,7 +737,7 @@ def main():
         print(f"Label: {query_label} Query ID: {query_id}")
 
         if args.end_time_ms is None:
-            end_ms = duration_ms
+            end_ms = duration_ms - 1
         else:
             end_ms = args.end_time_ms
 
@@ -706,7 +750,7 @@ def main():
         )
 
         print(
-            f"Sliding from {start_ms}ms to {end_ms}ms with step={step_size_ms}ms, window_size {window_size_ms}"
+            f"Sliding from {start_ms:.2f}ms to {end_ms:.2f}ms with step={step_size_ms:.2f}ms, window_size {window_size_ms:.2f}"
         )
         # query_scores = []  # List of tuples: (window_start_ms, window_end_ms, score) scor
         query_scores_df = score_windows_over_pose(
@@ -718,6 +762,7 @@ def main():
             model_name=model_to_use,
             step_size_ms=step_size_ms,
         )
+        query_scores_df["eng"] = args.eng
         query_scores_df["query_label"] = query_label
         query_scores_df["query_id"] = query_id
 
@@ -745,11 +790,11 @@ def main():
 
         all_query_score_dfs.append(query_scores_df)
     all_query_scores_df = pd.concat(all_query_score_dfs)
-    all_scores_out = run_dir/"all_scores.parquet"
+    all_scores_out = run_dir / "all_scores.parquet"
     all_query_scores_df.to_parquet(all_scores_out)
-    print(f"Final scores at {all_scores_out.resolve()}")
+    print(f"Final scores at \n{all_scores_out.resolve()}")
 
 
 if __name__ == "__main__":
     main()
-# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/demo_sign.py --pose_path "/opt/home/cleong/projects/semantic_and_visual_similarity/sign-bibles-dataset/samples/CBT-001-ase-2-Intro _ God Creates the World.pose" --start_time_ms 0 --end_time_ms 60000 --step_size_ms 500 --eng "God,GOD,god,star,day,earth,life,heaven" --models "asl_finetune_checkpoint_best"
+# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "/opt/home/cleong/projects/semantic_and_visual_similarity/sign-bibles-dataset/samples/CBT-001-ase-2-Intro _ God Creates the World.pose" --start_time_ms 0 --end_time_ms 60000 --step_size_ms 500 --eng "god created heaven earth" --model "asl_finetune_checkpoint_best"
