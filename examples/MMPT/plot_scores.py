@@ -4,69 +4,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# import plotly.graph_objects as go
-# import pandas as pd
-# from plotly.colors import qualitative
-
-# def plotly_scores_by_query(
-#     df: pd.DataFrame,
-#     x_col: str = "window_midpoint_ms",
-#     y_col: str = "score",
-#     query_id_col: str = "query_id",
-#     label_col: str = "query_label",
-#     title: str = "Scores by Query",
-#     color_palette=None,
-# ) -> go.Figure:
-#     """
-#     Plot an interactive Plotly line plot of scores per query_id,
-#     with shared color for identical query_labels.
-
-#     Parameters:
-#     - df: DataFrame containing the data
-#     - x_col: column for x-axis (e.g., frame, time)
-#     - y_col: column for y-axis (score)
-#     - query_id_col: unique identifier per trace
-#     - label_col: shared label to group colors
-#     - title: plot title
-#     - color_palette: optional dict[label] -> color or list of colors
-
-#     Returns:
-#     - Plotly Figure object
-#     """
-#     fig = go.Figure()
-
-#     # Build color map: one color per query_label
-#     unique_labels = df[label_col].unique()
-#     if color_palette is None:
-#         base_colors = qualitative.Set2 + qualitative.Set3 + qualitative.Plotly
-#         color_palette = {
-#             label: base_colors[i % len(base_colors)]
-#             for i, label in enumerate(unique_labels)
-#         }
-
-#     # Plot each query_id separately
-#     for query_id, subdf in df.groupby(query_id_col):
-#         label = subdf[label_col].iloc[0]
-#         fig.add_trace(go.Scatter(
-#             x=subdf[x_col],
-#             y=subdf[y_col],
-#             mode="lines",
-#             name=f"{label} / {query_id}",
-#             line=dict(color=color_palette[label]),
-#             hovertemplate=f"{label}<br>{x_col}: %{{x}}<br>{y_col}: %{{y}}<extra>{query_id}</extra>",
-#         ))
-
-#     fig.update_layout(
-#         title=title,
-#         xaxis_title=x_col.capitalize(),
-#         yaxis_title=y_col.capitalize(),
-#         legend_title="Query Label / ID",
-#         template="plotly_white",
-#         height=600,
-#     )
-
-#     return fig
-
 
 def plot_scores_by_query(
     df,
@@ -118,6 +55,40 @@ def plot_scores_by_query(
     return fig
 
 
+def aggregate_label(df: pd.DataFrame, agg_fn='mean') -> pd.DataFrame:
+    """
+    Aggregate all query_ids together per timestep using the given aggregation function.
+
+    Parameters:
+    - df: DataFrame with columns ['window_midpoint_ms', 'score', 'query_id', 'query_label']
+    - agg_fn: Aggregation function, can be 'mean', 'sum', 'max', etc.
+
+    Returns:
+    - Aggregated DataFrame with one row per x (timestep), columns ['window_midpoint_ms', 'score']
+    """
+    if agg_fn not in {'mean', 'sum', 'max', 'min', 'median'}:
+        raise ValueError(f"Unsupported agg_fn: {agg_fn}")
+
+    grouped = df.groupby("window_midpoint_ms")["score"]
+    aggregated = getattr(grouped, agg_fn)().reset_index()
+    return aggregated
+
+
+def group_and_aggregate_by_label(df: pd.DataFrame, agg_fn='mean') -> pd.DataFrame:
+    """
+    Group by query_label, then aggregate each group using aggregate_label.
+
+    Returns a combined DataFrame with an extra column 'query_label'.
+    """
+    results = []
+    for label, group in df.groupby("query_label"):
+        agg_df = aggregate_label(group, agg_fn=agg_fn)
+        agg_df["query_label"] = label
+        results.append(agg_df)
+
+    return pd.concat(results, ignore_index=True)
+
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -129,17 +100,42 @@ def main():
         help="Path to the df",
     )    
     parser.add_argument(
-        "--out",
+        "--out-dir",
         type=Path,
-        default="plot.png",
+        # default="plot.png",
         help="where to save plot",
     )    
     args = parser.parse_args()
 
+    if args.out_dir is None: 
+        out_dir = args.df.parent 
+        
+    else:
+        out_dir = args.out_dir
+    out_stem = args.df.stem
+
+
     df = pd.read_parquet(args.df)
     fig = plot_scores_by_query(df)
-    fig.savefig(args.out)
-    print(args.out.resolve())
+
+    plot_out = out_dir/f"{out_stem}.png"
+    fig.savefig(plot_out)
+    print(plot_out.resolve())
+
+    for agg_fn in ["mean", "sum", "min"]:
+        agg_df = group_and_aggregate_by_label(df, agg_fn=agg_fn)
+        fig = plot_scores_by_query(
+            agg_df,
+            x_col="window_midpoint_ms",
+            y_col="score",
+            query_id_col=None,  # no line-style distinctions needed
+            label_col="query_label",
+            title=f"{agg_fn.capitalize()} Aggregated Scores by Label",
+        )
+        agg_out = out_dir/f"{out_stem}_{agg_fn}.png"
+        fig.savefig(agg_out)
+        print(agg_out.resolve())
+
 
 if __name__ == "__main__":
     main()
