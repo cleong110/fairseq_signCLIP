@@ -9,11 +9,8 @@ from mmpt.models import MMPTModel
 import matplotlib.pyplot as plt
 import uuid
 import time
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sign_language_gloss_utils.glosses.gloss_utils import get_dataset_vocab
+
 from sign_language_gloss_utils.glosses.text_utils import (
-    get_glosses_from_text,
     get_glosses_set_from_text,
     preprocess_text,
 )
@@ -613,6 +610,104 @@ def get_text_queries(query_glosses):
     return text_queries
 
 
+def search(
+    text_query,
+    pose_path,
+    pose_dataset_csv,
+    start_time_ms,
+    end_time_ms,
+    window_size_ms,
+    step_size_ms,
+    model_to_use,
+    results_dir,
+    eng_text_label="",
+):
+    if not pose_path.is_file():
+        raise FileNotFoundError(f"Pose file not found: {pose_path}")
+
+    dataset_df = pd.read_csv(pose_dataset_csv)
+    dataset_vocab = set(dataset_df["GLOSS"].unique())
+    print(f"Loaded dataset with vocab of length: {len(dataset_vocab)}")
+
+    query_glosses = get_glosses_set_from_text(
+        text_query, dataset_vocab, remove_stopwords=True
+    )
+    print(f"Glosses found for '{text_query}': {query_glosses}")
+
+    pose_queries = list(
+        get_pose_queries(query_glosses, dataset_df, samples_per_gloss=5)
+    )
+    text_queries = get_text_queries(query_glosses)
+
+    queries = text_queries + pose_queries
+
+    for q in queries:
+        print(q)
+
+    full_pose = load_pose(pose_path)
+    duration_ms = 1000 * len(full_pose.body.data) / full_pose.body.fps
+
+    run_dir = results_dir / model_to_use / pose_path.stem / str(uuid.uuid4())
+    queries_dir = run_dir / "queries"
+    queries_dir.mkdir(parents=True, exist_ok=True)
+
+    all_query_score_dfs = []
+
+    for query_label, query_id, query_value in queries:
+        query_start = start_time_ms if start_time_ms is not None else 0
+        query_end = end_time_ms if end_time_ms is not None else duration_ms - 1
+
+        print(f"Running query '{query_id}' from {query_start}ms to {query_end}ms")
+
+        query_dir = queries_dir / query_id
+        query_dir.mkdir(exist_ok=True)
+
+        out_png = (
+            query_dir
+            / f"{query_id}_scores_{query_start}_to_{query_end}_step{window_size_ms}.png"
+        )
+
+        query_scores_df = score_windows_over_pose(
+            pose_path=pose_path,
+            query=query_value,
+            start_ms=query_start,
+            end_ms=query_end,
+            window_size_ms=window_size_ms,
+            step_size_ms=step_size_ms,
+            model_name=model_to_use,
+        )
+
+        query_scores_df["eng"] = eng_text_label
+        query_scores_df["query_label"] = query_label
+        query_scores_df["query_id"] = query_id
+
+        # Plot
+        plt.figure(figsize=(10, 5))
+        plt.plot(
+            query_scores_df["window_midpoint_ms"], query_scores_df["score"], marker="o"
+        )
+        plt.title(
+            f"Score of '{query_id}' over Sliding Windows\n(step={step_size_ms}ms, window={window_size_ms}ms)"
+        )
+        plt.xlabel("Window Midpoint Time (ms)")
+        plt.ylabel("Score")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_png)
+        print(f"Saved plot: {out_png.resolve()}")
+
+        # Save per-query scores
+        scores_out = query_dir / "scores.parquet"
+        query_scores_df.to_parquet(scores_out)
+        print(f"Saved scores: {scores_out.resolve()}")
+
+        all_query_score_dfs.append(query_scores_df)
+
+    all_query_scores_df = pd.concat(all_query_score_dfs)
+    print(f"Finished all queries for {pose_path.name}")
+    return all_query_scores_df
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate pose and text similarity using SignCLIP."
@@ -676,7 +771,7 @@ def main():
         "--results-dir",
         type=Path,
         default=Path(__file__).parent / "results",
-        help="Model to use",
+        help="Where to save results",
     )
 
     parser.add_argument(
@@ -689,110 +784,23 @@ def main():
     )
 
     args = parser.parse_args()
-
-    pose_path = args.pose_path
-
-    if not pose_path.is_file():
-        print(f"Error: File {pose_path} does not exist.")
-        return
-    # Define sliding window parameters
-    window_size_ms = args.window_size_ms
-
-    step_size_ms = args.step_size_ms
-
-    text_query = args.eng
-
-    dataset_df = pd.read_csv(args.pose_dataset_csv)
-    dataset_vocab = set(dataset_df["GLOSS"].unique().tolist())
-    print(f"Loaded dataset with vocab of length: {len(dataset_vocab)}")
-
-    query_glosses = get_glosses_set_from_text(
-        text_query, dataset_vocab, remove_stopwords=True
-    )
-    print(f"Glosses found for '{text_query}': {query_glosses}")
-    pose_queries = list(
-        get_pose_queries(query_glosses, dataset_df, samples_per_gloss=5)
+    df = search(
+        text_query=args.eng,
+        pose_path=args.pose_path,
+        pose_dataset_csv=args.pose_dataset_csv,
+        start_time_ms=args.start_time_ms,
+        end_time_ms=args.end_time_ms,
+        window_size_ms=args.window_size_ms,
+        step_size_ms=args.step_size_ms,
+        model_to_use=args.model,
+        results_dir=args.results_dir,
+        eng_text_label=args.eng,
     )
 
-    text_queries = get_text_queries(query_glosses)
-
-    queries = text_queries + pose_queries
-
-    for q in queries:
-        print(q)
-
-    full_pose = load_pose(pose_path)
-    duration_ms = 1000 * len(full_pose.body.data) / full_pose.body.fps
-
-
-    model_to_use = args.model
-
-    run_dir = args.results_dir / model_to_use / pose_path.stem / str(uuid.uuid4())
-    queries_dir = run_dir / "queries"
-
-    all_query_score_dfs = []
-
-    for query_label, query_id, query_value in queries:
-        start_ms = args.start_time_ms or 0
-        print(f"Label: {query_label} Query ID: {query_id}")
-
-        if args.end_time_ms is None:
-            end_ms = duration_ms - 1
-        else:
-            end_ms = args.end_time_ms
-
-        query_dir = queries_dir / f"{query_id}"
-        query_dir.mkdir(exist_ok=True, parents=True)
-
-        out = (
-            query_dir
-            / f"{query_id}_scores_{start_ms}_to_{end_ms}_step{window_size_ms}.png"
-        )
-
-        print(
-            f"Sliding from {start_ms:.2f}ms to {end_ms:.2f}ms with step={step_size_ms:.2f}ms, window_size {window_size_ms:.2f}"
-        )
-        # query_scores = []  # List of tuples: (window_start_ms, window_end_ms, score) scor
-        query_scores_df = score_windows_over_pose(
-            pose_path,
-            query=query_value,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            window_size_ms=window_size_ms,
-            model_name=model_to_use,
-            step_size_ms=step_size_ms,
-        )
-        query_scores_df["eng"] = args.eng
-        query_scores_df["query_label"] = query_label
-        query_scores_df["query_id"] = query_id
-
-        # window_starts = [start for start, _, _ in eng_query_scores]
-        window_midpoints = query_scores_df["window_midpoint_ms"].tolist()
-        scores = query_scores_df["score"].tolist()
-        # scores = [score for _, _, score in query_scores]
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(window_midpoints, scores, marker="o", linestyle="-")
-        plt.title(
-            f"Score of '{query_id}' over Sliding Windows, step={step_size_ms}ms, size={window_size_ms}"
-        )
-        plt.xlabel("Window Midpoint Time (ms)")
-        plt.ylabel("Score")
-        plt.grid(True)
-        plt.tight_layout()
-
-        plt.savefig(out)
-        print(out.resolve())
-
-        scores_out = query_dir / "scores.parquet"
-        query_scores_df.to_parquet(scores_out)
-        print(scores_out.resolve())
-
-        all_query_score_dfs.append(query_scores_df)
-    all_query_scores_df = pd.concat(all_query_score_dfs)
-    all_scores_out = run_dir / "all_scores.parquet"
-    all_query_scores_df.to_parquet(all_scores_out)
-    print(f"Final scores at \n{all_scores_out.resolve()}")
+    run_dir = args.results_dir / args.model / args.pose_path.stem / "last_run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(run_dir / "all_scores.parquet")
+    print(f"Saved all scores to {run_dir / 'all_scores.parquet'}")
 
 
 if __name__ == "__main__":
