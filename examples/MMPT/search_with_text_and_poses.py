@@ -1,4 +1,5 @@
 from collections import defaultdict
+import json
 import argparse
 from pathlib import Path
 import torch
@@ -19,6 +20,12 @@ from contextlib import contextmanager
 import os
 from tqdm import tqdm
 from functools import cache
+
+from analyze_scores import (
+    aggregate_label_by_queryid,
+    group_and_aggregate_by_label,
+    find_peaks_in_df,
+)
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow C++ backend logs
 os.environ["GLOG_minloglevel"] = "3"  # Suppress GLOG messages from XLA/CUDA
@@ -610,7 +617,7 @@ def get_text_queries(query_glosses):
     return text_queries
 
 
-def search(
+def score_with_text_and_gloss_keywords(
     text_query,
     pose_path,
     pose_dataset_csv,
@@ -657,7 +664,7 @@ def search(
         query_start = start_time_ms if start_time_ms is not None else 0
         query_end = end_time_ms if end_time_ms is not None else duration_ms - 1
 
-        print(f"Running query '{query_id}' from {query_start}ms to {query_end}ms")
+        print(f"Running query '{query_id}' from {query_start}ms to {query_end:.2f}ms")
 
         query_dir = queries_dir / query_id
         query_dir.mkdir(exist_ok=True)
@@ -755,8 +762,35 @@ def main():
     parser.add_argument(
         "--eng",
         type=str,
-        default="god",
+        # default="god",
         help="English text to look for (comma-separated)",
+    )
+
+    parser.add_argument(
+        "--prominence",
+        type=float,
+        # default="god",
+        help="Passed to the find_peaks function for finding 'hits'",
+    )
+
+    parser.add_argument(
+        "--height_multiplier",
+        type=float,
+        # default="god",
+        help="Passed to the find_peaks function for finding 'hits'",
+    )
+
+    parser.add_argument(
+        "--density_weight",
+        type=float,
+        # default="god",
+        help="How much to weight hit density. ",
+    )
+
+    parser.add_argument(
+        "--query-json",
+        type=Path,
+        help="JSON with queries in it. Otherwise will look for one at pose_path.transcripts.json",
     )
 
     parser.add_argument(
@@ -784,23 +818,71 @@ def main():
     )
 
     args = parser.parse_args()
-    df = search(
-        text_query=args.eng,
-        pose_path=args.pose_path,
-        pose_dataset_csv=args.pose_dataset_csv,
-        start_time_ms=args.start_time_ms,
-        end_time_ms=args.end_time_ms,
-        window_size_ms=args.window_size_ms,
-        step_size_ms=args.step_size_ms,
-        model_to_use=args.model,
-        results_dir=args.results_dir,
-        eng_text_label=args.eng,
-    )
 
+    # ----------- Load Query Text from JSON
+    if args.query_json is None:
+        # try looking
+        # there's multiple extensions
+        pose_path_true_stem = args.pose_path.name.split(".")[0]
+        possible_transcript_json = args.pose_path.parent / f"{pose_path_true_stem}.transcripts.json"
+        if possible_transcript_json.is_file():
+            transcript_json_path = possible_transcript_json
+    else:
+        transcript_json_path = args.query_json
+
+    if transcript_json_path is not None:
+        with open(transcript_json_path) as f: 
+            transcripts = json.load(f)
+    exit()
+
+    # ----------- Get "Keyword" scores
+    with timed_section("Get Keyword Scores") as t:
+        df = score_with_text_and_gloss_keywords(
+            text_query=args.eng,
+            pose_path=args.pose_path,
+            pose_dataset_csv=args.pose_dataset_csv,
+            start_time_ms=args.start_time_ms,
+            end_time_ms=args.end_time_ms,
+            window_size_ms=args.window_size_ms,
+            step_size_ms=args.step_size_ms,
+            model_to_use=args.model,
+            results_dir=args.results_dir,
+            eng_text_label=args.eng,
+        )
     run_dir = args.results_dir / args.model / args.pose_path.stem / "last_run"
     run_dir.mkdir(parents=True, exist_ok=True)
     df.to_parquet(run_dir / "all_scores.parquet")
     print(f"Saved all scores to {run_dir / 'all_scores.parquet'}")
+
+    # ----------- Aggregate by label, then by query ID to get one signal for each label
+    agg_df = group_and_aggregate_by_label(df)
+    print(agg_df)
+
+    # ------------Find Peaks
+    mean_score = agg_df["score"].mean()
+    agg_peaks_df = find_peaks_in_df(
+        agg_df, group_col="query_label", prominence=args.prominence, height=mean_score
+    )
+
+    # ------------ Rank Segments by match count and density
+    # load in the segments from the json
+    # for each segment
+    # hit_count from find_peaks
+    hit_count = len(agg_peaks_df)
+    # density_weight
+    density_weight = args.density_weight
+
+    # hits per unit length
+
+    # relevance = score = H + 10 * D
+
+    # sort by relevance
+
+    # ------------- Write out Predictions: seg_idx, rank
+    # TODO: fix off by one error in vref annotations
+
+    # -------------- Grade Predictions
+    # not here. Other script.
 
 
 if __name__ == "__main__":
