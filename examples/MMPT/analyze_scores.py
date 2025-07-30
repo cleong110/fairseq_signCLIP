@@ -17,6 +17,7 @@ def plot_scores_by_query(
     palette="tab10",
     peaks_df=None,
     plot_avg_y=True,
+    max_legend_allowed=10,
 ):
     """
     Plot scores over time, one trace per query_id,
@@ -29,7 +30,7 @@ def plot_scores_by_query(
     if plot_avg_y:
         avg_y = df[y_col].mean()
         ax.axhline(avg_y, ls='--')
-
+    # show_legend = df[query_id_col].nunique() <= max_legend_allowed
     sns.lineplot(
         data=df,
         x=x_col,
@@ -38,11 +39,14 @@ def plot_scores_by_query(
         style=query_id_col if query_id_col else None,
         estimator=None,
         palette=palette,
+        # legend="full" if show_legend else False,
         legend="full",
         linewidth=1,
         alpha=0.8,
         ax=ax,
     )
+
+    
 
     if peaks_df is not None and not peaks_df.empty:
         sns.scatterplot(
@@ -57,15 +61,30 @@ def plot_scores_by_query(
             legend=False,  # avoid duplicate legend
         )
 
-    ax.set_title(title)
-    ax.set_xlabel(x_col.capitalize())
+    
+
+    # Only keep entries that match the label_col values
+    if query_id_col in df.columns and df[query_id_col].nunique() > max_legend_allowed:
+        handles, labels = ax.get_legend_handles_labels()
+        label_values = df[label_col].unique().astype(str)
+
+        filtered = [(h, l) for h, l in zip(handles, labels) if l in label_values]
+
+        if filtered:
+            ax.legend(*zip(*filtered), title=label_col)
+        else:
+            ax.legend_.remove()
+
+    # ax.set_title(title)
+    x_axis_label = " ".join(xl.capitalize() for xl in x_col.split("_"))
+    ax.set_xlabel(x_axis_label)
     ax.set_ylabel(y_col.capitalize())
     fig.tight_layout()
 
     return fig
 
 
-def aggregate_label(df: pd.DataFrame, agg_fn="mean") -> pd.DataFrame:
+def aggregate_label_by_queryid(df: pd.DataFrame, agg_fn="mean") -> pd.DataFrame:
     """
     Aggregate all query_ids together per timestep using the given aggregation function.
 
@@ -86,13 +105,15 @@ def aggregate_label(df: pd.DataFrame, agg_fn="mean") -> pd.DataFrame:
 
 def group_and_aggregate_by_label(df: pd.DataFrame, agg_fn="mean") -> pd.DataFrame:
     """
-    Group by query_label, then aggregate each group using aggregate_label.
+    Group by query_label, then aggregate each group using aggregate_label_by_queryid.
 
     Returns a combined DataFrame with an extra column 'query_label'.
+    So this gives us one df each for, e.g. "CREATE", "EARTH", etc.
     """
     results = []
     for label, group in df.groupby("query_label"):
-        agg_df = aggregate_label(group, agg_fn=agg_fn)
+        # print(f"Aggregating {label}. Group has {len(group)}")
+        agg_df = aggregate_label_by_queryid(group, agg_fn=agg_fn)
         agg_df["query_label"] = label
         results.append(agg_df)
 
@@ -131,6 +152,28 @@ def find_peaks_in_df(
     return pd.DataFrame(peak_rows)
 
 
+def count_peaks_in_range(peaks_df: pd.DataFrame, start_ms: int, end_ms: int) -> int:
+    """
+    Count the number of peaks within the given time range [start_ms, end_ms].
+
+    Parameters:
+    - peaks_df: DataFrame with a column 'window_midpoint_ms' representing time of peaks.
+    - start_ms: Start of the time range (inclusive).
+    - end_ms: End of the time range (inclusive).
+
+    Returns:
+    - Integer count of peaks within the specified time window.
+    """
+    if "window_midpoint_ms" not in peaks_df.columns:
+        raise ValueError("peaks_df must contain a 'window_midpoint_ms' column.")
+    
+    in_range = peaks_df[
+        (peaks_df["window_midpoint_ms"] >= start_ms) &
+        (peaks_df["window_midpoint_ms"] <= end_ms)
+    ]
+    return len(in_range)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate pose and text similarity using SignCLIP."
@@ -166,9 +209,10 @@ def main():
 
     for agg_fn in ["mean", "sum", "min"]:
         agg_df = group_and_aggregate_by_label(df, agg_fn=agg_fn)
-        print(agg_df.head())
+        # print(agg_df.head())
         mean_score = agg_df["score"].mean()
         agg_peaks_df = find_peaks_in_df(agg_df, group_col="query_label", prominence=1, height=mean_score)
+        print(agg_peaks_df.head())
         fig = plot_scores_by_query(
             agg_df,
             x_col="window_midpoint_ms",
@@ -181,6 +225,9 @@ def main():
         agg_out = out_dir / f"{out_stem}_{agg_fn}.png"
         fig.savefig(agg_out)
         print(agg_out.resolve())
+
+        num_peaks = count_peaks_in_range(peaks_df, start_ms=5000, end_ms=10000)
+        print(f"Number of peaks between 5s and 10s: {num_peaks}")
 
 
 if __name__ == "__main__":

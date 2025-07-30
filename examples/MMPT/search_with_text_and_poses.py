@@ -325,7 +325,7 @@ def preprocess_pose(pose, max_frames=None):
         np.expand_dims(feat, axis=0)
     ).float()  # e.g., torch.Size([1, frame count, 609])
     if max_frames is not None and pose_frames.size(1) > max_frames:
-        print(
+        logger.warning(
             f"pose sequence length too long ({pose_frames.size(1)}) longer than {max_frames} frames. Truncating"
         )
         pose_frames = pose_frames[:, :max_frames, :]
@@ -466,9 +466,6 @@ def score_either_format(query: SignCLIPEmbeddable, target: SignCLIPEmbeddable):
     query_embed = embed_either_format(query)
     second_embed = embed_either_format(target)
     score = np.matmul(query_embed, second_embed.T).squeeze()
-    # print(f"Types! {type(query_embed)}, {type(second_embed)}")
-    # print(f"Shapes! {query_embed.shape}, {second_embed.shape}")
-    # exit()
     return float(score)
 
 
@@ -568,7 +565,6 @@ def score_windows_over_pose(
         pose_embedding = load_window_embedding(
             pose_path=pose_path, start_time_ms=window_start, end_time_ms=window_end
         )
-        # print(type(pose_embedding))
 
         score = float(np.matmul(query_embed, pose_embedding.T).squeeze())
 
@@ -628,28 +624,29 @@ def score_with_text_and_gloss_keywords(
     model_to_use,
     results_dir,
     eng_text_label="",
+    samples_per_gloss=5,
 ):
     if not pose_path.is_file():
         raise FileNotFoundError(f"Pose file not found: {pose_path}")
 
     dataset_df = pd.read_csv(pose_dataset_csv)
     dataset_vocab = set(dataset_df["GLOSS"].unique())
-    print(f"Loaded dataset with vocab of length: {len(dataset_vocab)}")
+    logger.info(f"Loaded dataset with vocab of length: {len(dataset_vocab)}")
 
     query_glosses = get_glosses_set_from_text(
         text_query, dataset_vocab, remove_stopwords=True
     )
-    print(f"Glosses found for '{text_query}': {query_glosses}")
+    logger.info(f"Glosses found for '{text_query}': {query_glosses}")
 
     pose_queries = list(
-        get_pose_queries(query_glosses, dataset_df, samples_per_gloss=5)
+        get_pose_queries(query_glosses, dataset_df, samples_per_gloss=samples_per_gloss)
     )
     text_queries = get_text_queries(query_glosses)
 
     queries = text_queries + pose_queries
 
     for q in queries:
-        print(q)
+        logger.info(f"Gloss/Keyword Query: {q}")
 
     full_pose = load_pose(pose_path)
     duration_ms = 1000 * len(full_pose.body.data) / full_pose.body.fps
@@ -664,7 +661,9 @@ def score_with_text_and_gloss_keywords(
         query_start = start_time_ms if start_time_ms is not None else 0
         query_end = end_time_ms if end_time_ms is not None else duration_ms - 1
 
-        print(f"Running query '{query_id}' from {query_start}ms to {query_end:.2f}ms")
+        logger.info(
+            f"Running query '{query_id}' from {query_start}ms to {query_end:.2f}ms"
+        )
 
         query_dir = queries_dir / query_id
         query_dir.mkdir(exist_ok=True)
@@ -701,17 +700,25 @@ def score_with_text_and_gloss_keywords(
         plt.grid(True)
         plt.tight_layout()
         plt.savefig(out_png)
-        print(f"Saved plot: {out_png.resolve()}")
+        logger.info(f"Saved plot: {out_png.resolve()}")
 
         # Save per-query scores
         scores_out = query_dir / "scores.parquet"
         query_scores_df.to_parquet(scores_out)
-        print(f"Saved scores: {scores_out.resolve()}")
+        logger.info(f"Saved scores: {scores_out.resolve()}")
 
         all_query_score_dfs.append(query_scores_df)
 
     all_query_scores_df = pd.concat(all_query_score_dfs)
-    print(f"Finished all queries for {pose_path.name}")
+    all_query_scores_df["text_query"] = text_query
+    all_query_scores_df["target_video_name"] = pose_path.name
+    all_query_scores_df["samples_per_gloss"] = samples_per_gloss
+    all_query_scores_df["search_start_time_ms"] = start_time_ms
+    all_query_scores_df["search_end_time_ms"] = end_time_ms
+    all_query_scores_df["search_window_size_ms"] = window_size_ms
+    all_query_scores_df["search_step_size_ms"] = step_size_ms
+    all_query_scores_df["model_to_use"] = model_to_use
+    logger.info(f"Finished all queries for {pose_path.name}")
     return all_query_scores_df
 
 
@@ -824,67 +831,105 @@ def main():
         # try looking
         # there's multiple extensions
         pose_path_true_stem = args.pose_path.name.split(".")[0]
-        possible_transcript_json = args.pose_path.parent / f"{pose_path_true_stem}.transcripts.json"
+        possible_transcript_json = (
+            args.pose_path.parent / f"{pose_path_true_stem}.transcripts.json"
+        )
         if possible_transcript_json.is_file():
             transcript_json_path = possible_transcript_json
     else:
         transcript_json_path = args.query_json
 
+    transcripts = []
     if transcript_json_path is not None:
-        with open(transcript_json_path) as f: 
+        with open(transcript_json_path) as f:
             transcripts = json.load(f)
-    exit()
 
-    # ----------- Get "Keyword" scores
-    with timed_section("Get Keyword Scores") as t:
-        df = score_with_text_and_gloss_keywords(
-            text_query=args.eng,
-            pose_path=args.pose_path,
-            pose_dataset_csv=args.pose_dataset_csv,
-            start_time_ms=args.start_time_ms,
-            end_time_ms=args.end_time_ms,
-            window_size_ms=args.window_size_ms,
-            step_size_ms=args.step_size_ms,
-            model_to_use=args.model,
-            results_dir=args.results_dir,
-            eng_text_label=args.eng,
+    segment_indices = []
+    text_queries = []
+    for seg_idx, transcript_dict in enumerate(transcripts):
+        q = transcript_dict["text"]
+        text_queries.append(q)
+        segment_indices.append(seg_idx)
+        logger.info(f"Segment {seg_idx} query: {q}")
+    run_dir = args.results_dir / args.model / args.pose_path.stem / f"{uuid.uuid4()}"
+
+    if args.eng is None:
+        text_queries.append("")
+        segment_indices.append(9999)
+    else:
+        text_queries.append(args.eng)
+        segment_indices.append(9999)
+
+    for seg_idx, text_query in zip(segment_indices, text_queries):
+        query_dir = run_dir / f"seg_idx{seg_idx}"
+        query_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"Query {seg_idx}:\n{text_query}\n{query_dir}")
+        if not text_query:
+            continue
+        # ----------- Get "Keyword" scores
+        with timed_section("Get Keyword Scores") as t:
+            df = score_with_text_and_gloss_keywords(
+                text_query=text_query,
+                pose_path=args.pose_path,
+                pose_dataset_csv=args.pose_dataset_csv,
+                start_time_ms=args.start_time_ms,
+                end_time_ms=args.end_time_ms,
+                window_size_ms=args.window_size_ms,
+                step_size_ms=args.step_size_ms,
+                model_to_use=args.model,
+                results_dir=query_dir,
+                eng_text_label=args.eng,
+            )
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(query_dir / "all_scores.parquet")
+        logger.info(f"Saved all scores to {run_dir / 'all_scores.parquet'}")
+
+        # ----------- Aggregate by label, then by query ID to get one signal for each label
+        agg_df = group_and_aggregate_by_label(df)
+        logger.info("agg_df:")
+        logger.info(agg_df)
+
+        # ------------Find Peaks
+        mean_score = agg_df["score"].mean()
+        agg_peaks_df = find_peaks_in_df(
+            agg_df,
+            group_col="query_label",
+            prominence=args.prominence,
+            height=mean_score,
         )
-    run_dir = args.results_dir / args.model / args.pose_path.stem / "last_run"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(run_dir / "all_scores.parquet")
-    print(f"Saved all scores to {run_dir / 'all_scores.parquet'}")
 
-    # ----------- Aggregate by label, then by query ID to get one signal for each label
-    agg_df = group_and_aggregate_by_label(df)
-    print(agg_df)
+        # ------------ Rank Segments by match count and density
+        # load in the segments from the json
+        # for each segment
+        # hit_count from find_peaks
+        hit_count = len(agg_peaks_df)
+        # density_weight
+        density_weight = args.density_weight
 
-    # ------------Find Peaks
-    mean_score = agg_df["score"].mean()
-    agg_peaks_df = find_peaks_in_df(
-        agg_df, group_col="query_label", prominence=args.prominence, height=mean_score
-    )
+        # hits per unit length
 
-    # ------------ Rank Segments by match count and density
-    # load in the segments from the json
-    # for each segment
-    # hit_count from find_peaks
-    hit_count = len(agg_peaks_df)
-    # density_weight
-    density_weight = args.density_weight
+        # relevance = score = H + 10 * D
 
-    # hits per unit length
+        # sort by relevance
 
-    # relevance = score = H + 10 * D
+        # ------------- Write out Predictions: seg_idx, rank
+        # TODO: fix off by one error in vref annotations
 
-    # sort by relevance
-
-    # ------------- Write out Predictions: seg_idx, rank
-    # TODO: fix off by one error in vref annotations
-
-    # -------------- Grade Predictions
-    # not here. Other script.
+        # -------------- Grade Predictions
+        # not here. Other script.
 
 
 if __name__ == "__main__":
     main()
-# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "/opt/home/cleong/projects/semantic_and_visual_similarity/sign-bibles-dataset/samples/CBT-001-ase-2-Intro _ God Creates the World.pose" --start_time_ms 0 --end_time_ms 60000 --step_size_ms 500 --eng "god created heaven earth" --model "asl_finetune_checkpoint_best"
+
+# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "test_data/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 5000 --end_time_ms 60000 --step_size_ms 10 --window_size_ms 1500 --eng "god life heaven sky earth" --model "asl_finetune_checkpoint_best"
+
+
+
+# find test_data/ -name "*.pose"|parallel -j2 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 10 --window_size_ms 1000 --model "asl_finetune_checkpoint_best"
+# find test_data/ -name "*.pose"|parallel -j2 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 100 --window_size_ms 3000 --eng "god" --model "asl_finetune_checkpoint_best"
+
+# just God creates the world
+# find test_data/ -name "*passage _ god creates the world.pose-mediapipe*.pose"|parallel -j1 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 100 --window_size_ms 1000 --eng "refrigerator" --model "asl_finetune_checkpoint_best"
+
