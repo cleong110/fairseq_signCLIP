@@ -1,3 +1,4 @@
+from collections import defaultdict
 import json
 from pathlib import Path
 import argparse
@@ -171,9 +172,10 @@ def count_peaks_in_range(peaks_df: pd.DataFrame, start_ms: int, end_ms: int) -> 
     ]
     return len(in_range)
 
+
 def rank_segments(
     segments_ms_windows: list[tuple[int, int]], peaks_df, density_weight: float = 10.0
-) -> list[tuple[int, tuple[int, int], float]]:
+) -> pd.DataFrame:
     """
     Rank segment windows by relevance based on number and density of peaks.
 
@@ -183,9 +185,10 @@ def rank_segments(
         density_weight: Weighting factor for peak density.
 
     Returns:
-        List of (seg_idx, (start_ms, end_ms), relevance_score) sorted by descending score.
+        A DataFrame sorted by descending relevance score, with columns:
+        ['seg_idx', 'start_ms', 'end_ms', 'num_peaks', 'density', 'relevance_score', 'rank']
     """
-    seg_relevance_scores = []
+    seg_relevance_data = defaultdict(list)
 
     for seg_idx, (start_ms, end_ms) in enumerate(segments_ms_windows):
         num_peaks = count_peaks_in_range(peaks_df, start_ms=start_ms, end_ms=end_ms)
@@ -203,19 +206,26 @@ def rank_segments(
             f"density={peak_density:.4f}, score={relevance_score:.4f}"
         )
 
-        seg_relevance_scores.append((seg_idx, (start_ms, end_ms), relevance_score))
+        seg_relevance_data["seg_idx"].append(seg_idx)
+        seg_relevance_data["start_ms"].append(start_ms)
+        seg_relevance_data["end_ms"].append(end_ms)
+        seg_relevance_data["num_peaks"].append(num_peaks)
+        seg_relevance_data["density"].append(peak_density)
+        seg_relevance_data["relevance_score"].append(relevance_score)
 
-    # Sort by descending relevance score
-    sorted_segments = sorted(seg_relevance_scores, key=lambda x: x[2], reverse=True)
-    print(sorted_segments)
-    return sorted_segments
+    df = pd.DataFrame(seg_relevance_data)
+
+    if df.empty:
+        print("Warning: No valid segments found.")
+        return df
+
+    df = df.sort_values(by="relevance_score", ascending=False).reset_index(drop=True)
+    df["rank"] = df.index + 1  # Rank starting from 1
+
+    return df
 
 
-    # Return only the windows (drop the scores)
-    # return [window for window, _ in sorted_segments]
-
-
-
+def full_df_analysis(df,):
 
 def main():
     parser = argparse.ArgumentParser(
@@ -285,8 +295,15 @@ def main():
     print(pose_info)
 
     segments_ms_windows = []
+    true_seg_idx = None
+    original_query = None
     if transcripts is not None:
         for seg_idx, transcript in enumerate(transcripts):
+            if args.df.parent.name == f"seg_idx{seg_idx}":
+                true_seg_idx = seg_idx
+                original_query = transcript["text"]
+                print(f"TRUE SEGMENT INDEX: {true_seg_idx}")
+
             # print(transcript)
             start_frame = transcript["start_frame"]
             end_frame = transcript["end_frame"]
@@ -302,7 +319,7 @@ def main():
 
     df = pd.read_parquet(args.df)
 
-    # Optionally compute and overlay peaks
+    # --------------------- plotting scores for all the query ids ----------------------------
     height = df["score"].mean() * args.height_multiplier
     peaks_df = find_peaks_in_df(df, prominence=args.prominence, height=height)
     fig = plot_scores_by_query(df, peaks_df=peaks_df, height_line=height)
@@ -320,67 +337,87 @@ def main():
         # fig = plot_scores_by_query(
         #     query_df, peaks_df=query_peaks_df, height_line=height
         # )
-        fig = plot_scores_by_query(
-            query_df, height_line=height
-        )
+        fig = plot_scores_by_query(query_df, height_line=height)
         plot_out = out_dir / f"{out_stem}_{query_label}_notaggregated.png"
         fig.savefig(plot_out)
         print(plot_out.resolve())
 
-    for agg_fn in ["mean", "sum", "min"]:
-        agg_df = group_and_aggregate_by_label(df, agg_fn=agg_fn)
-        # print(agg_df.head())
-        mean_score = agg_df["score"].mean()
-        height = mean_score * args.height_multiplier
-        agg_peaks_df = find_peaks_in_df(
-            agg_df,
-            group_col="query_label",
-            prominence=args.prominence,
-            height=height,
-        )
-        print(agg_peaks_df.head())
-        fig = plot_scores_by_query(
-            agg_df,
-            x_col="window_midpoint_ms",
-            y_col="score",
-            query_id_col=None,  # no line-style distinctions needed
-            label_col="query_label",
-            title=f"{agg_fn.capitalize()} Aggregated Scores by Label",
-            peaks_df=agg_peaks_df,
-            height_line=height,
-        )
-        agg_out = out_dir / f"{out_stem}_{agg_fn}.png"
-        fig.savefig(agg_out)
-        print(agg_out.resolve())
-        rank_segments(segments_ms_windows, agg_peaks_df, args.density_weight)
+    # -------- Testing out various aggregation functions, let's just go with the mean!
+    # for agg_fn in ["mean", "sum", "min"]:
+    #     agg_df = group_and_aggregate_by_label(df, agg_fn=agg_fn)
+    #     # print(agg_df.head())
+    #     mean_score = agg_df["score"].mean()
+    #     height = mean_score * args.height_multiplier
+    #     agg_peaks_df = find_peaks_in_df(
+    #         agg_df,
+    #         group_col="query_label",
+    #         prominence=args.prominence,
+    #         height=height,
+    #     )
+    #     print(agg_peaks_df.head())
+    #     fig = plot_scores_by_query(
+    #         agg_df,
+    #         x_col="window_midpoint_ms",
+    #         y_col="score",
+    #         query_id_col=None,  # no line-style distinctions needed
+    #         label_col="query_label",
+    #         title=f"{agg_fn.capitalize()} Aggregated Scores by Label",
+    #         peaks_df=agg_peaks_df,
+    #         height_line=height,
+    #     )
+    #     agg_out = out_dir / f"{out_stem}_{agg_fn}.png"
+    #     fig.savefig(agg_out)
+    #     print(agg_out.resolve())
 
-    agg_df = group_and_aggregate_by_label(df, agg_fn="mean")
-    print(agg_df.head())
+    # ------------ do the actual ranking ---------------------------------------------------
+    mean_df = group_and_aggregate_by_label(df, agg_fn="mean")
+    height = df["score"].mean() * args.height_multiplier
+    peaks_for_mean_df = find_peaks_in_df(df, prominence=args.prominence, height=height)
+    print(mean_df.head())
 
-    for query_label, query_label_df in agg_df.groupby("query_label"):
-        mean_score = query_label_df["score"].mean()
-        height = mean_score * args.height_multiplier
-        agg_peaks_df = find_peaks_in_df(
-            query_label_df,
-            group_col="query_label",
-            prominence=1,
-            height=height,
-        )
-        fig = plot_scores_by_query(
-            query_label_df,
-            x_col="window_midpoint_ms",
-            y_col="score",
-            query_id_col=None,  # no line-style distinctions needed
-            label_col="query_label",
-            title=f"{query_label} Aggregated Scores by Label",
-            peaks_df=agg_peaks_df,
-            height_line=height,
-        )
-        query_label_out = out_dir / f"{out_stem}_mean_{query_label}.png"
-        fig.savefig(query_label_out)
-        print(query_label_out.resolve())
+    fig = plot_scores_by_query(
+        mean_df,
+        x_col="window_midpoint_ms",
+        y_col="score",
+        query_id_col=None,  # no line-style distinctions needed
+        label_col="query_label",
+        title="Mean Aggregated Scores by Query Label",
+        peaks_df=peaks_for_mean_df,
+        height_line=height,
+    )
+    mean_out = out_dir / f"{out_stem}_mean.png"
+    fig.savefig(mean_out)
+    print(mean_out.resolve())
+    segment_rankings = rank_segments(
+        segments_ms_windows, peaks_for_mean_df, args.density_weight
+    )
 
-    # get the segments
+    # for segment_ranking in segment_rankings:
+    print(segment_rankings)
+
+    # # plot agg scores/peaks for each query label for fun/analysis
+    # for query_label, query_label_df in mean_df.groupby("query_label"):
+    #     mean_score = query_label_df["score"].mean()
+    #     height = mean_score * args.height_multiplier
+    #     query_peaks_df = find_peaks_in_df(
+    #         query_label_df,
+    #         group_col="query_label",
+    #         prominence=1,
+    #         height=height,
+    #     )
+    #     fig = plot_scores_by_query(
+    #         query_label_df,
+    #         x_col="window_midpoint_ms",
+    #         y_col="score",
+    #         query_id_col=None,  # no line-style distinctions needed
+    #         label_col="query_label",
+    #         title=f"{query_label} Aggregated Scores by Label",
+    #         peaks_df=query_peaks_df,
+    #         height_line=height,
+    #     )
+    #     query_label_out = out_dir / f"{out_stem}_mean_{query_label}.png"
+    #     fig.savefig(query_label_out)
+    #     print(query_label_out.resolve())
 
 
 if __name__ == "__main__":
