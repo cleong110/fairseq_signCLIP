@@ -224,8 +224,9 @@ def rank_segments(
 
     return df
 
+# help me do this
+# def full_df_analysis(df, ):
 
-def full_df_analysis(df,):
 
 def main():
     parser = argparse.ArgumentParser(
@@ -279,7 +280,8 @@ def main():
 
     transcripts = None
     if args.query_json is not None:
-        with open(args.query_json) as f:
+        query_json_path = args.query_json
+        with open(query_json_path) as f:
             transcripts = json.load(f)
 
     else:
@@ -320,27 +322,27 @@ def main():
     df = pd.read_parquet(args.df)
 
     # --------------------- plotting scores for all the query ids ----------------------------
-    height = df["score"].mean() * args.height_multiplier
-    peaks_df = find_peaks_in_df(df, prominence=args.prominence, height=height)
-    fig = plot_scores_by_query(df, peaks_df=peaks_df, height_line=height)
+    # height = df["score"].mean() * args.height_multiplier
+    # peaks_df = find_peaks_in_df(df, prominence=args.prominence, height=height)
+    # fig = plot_scores_by_query(df, peaks_df=peaks_df, height_line=height)
 
-    plot_out = out_dir / f"{out_stem}.png"
-    fig.savefig(plot_out)
-    print(plot_out.resolve())
+    # plot_out = out_dir / f"{out_stem}.png"
+    # fig.savefig(plot_out)
+    # print(plot_out.resolve())
 
-    # Also plot for all scores for each query_label
-    for query_label, query_df in df.groupby("query_label"):
-        height = query_df["score"].mean() * args.height_multiplier
-        query_peaks_df = find_peaks_in_df(
-            query_df, prominence=args.prominence, height=height
-        )
-        # fig = plot_scores_by_query(
-        #     query_df, peaks_df=query_peaks_df, height_line=height
-        # )
-        fig = plot_scores_by_query(query_df, height_line=height)
-        plot_out = out_dir / f"{out_stem}_{query_label}_notaggregated.png"
-        fig.savefig(plot_out)
-        print(plot_out.resolve())
+    # # Also plot for all scores for each query_label
+    # for query_label, query_df in df.groupby("query_label"):
+    #     height = query_df["score"].mean() * args.height_multiplier
+    #     query_peaks_df = find_peaks_in_df(
+    #         query_df, prominence=args.prominence, height=height
+    #     )
+    #     # fig = plot_scores_by_query(
+    #     #     query_df, peaks_df=query_peaks_df, height_line=height
+    #     # )
+    #     fig = plot_scores_by_query(query_df, height_line=height)
+    #     plot_out = out_dir / f"{out_stem}_{query_label}_notaggregated.png"
+    #     fig.savefig(plot_out)
+    #     print(plot_out.resolve())
 
     # -------- Testing out various aggregation functions, let's just go with the mean!
     # for agg_fn in ["mean", "sum", "min"]:
@@ -388,12 +390,44 @@ def main():
     mean_out = out_dir / f"{out_stem}_mean.png"
     fig.savefig(mean_out)
     print(mean_out.resolve())
-    segment_rankings = rank_segments(
+    segment_rankings_df = rank_segments(
         segments_ms_windows, peaks_for_mean_df, args.density_weight
     )
 
-    # for segment_ranking in segment_rankings:
-    print(segment_rankings)
+    # segment_rankings_df has seg_idx start_ms end_ms num_peaks  density relevance_score  rank
+    # video_id,query_text,rank,seg_idx (rest of columns) is the desired output
+    if true_seg_idx is not None and original_query is not None:
+        print(true_seg_idx, original_query)
+        video_id = query_json_path.name.split(".")[0]
+        segment_rankings_df["video_id"] = video_id
+
+    desired_columns = [
+        "video_id",
+        "query_text",
+        "rank",
+        "seg_idx",
+        "start_ms",
+        "end_ms",
+        "num_peaks",
+        "density",
+        "relevance_score",
+    ]
+
+    # Only include columns that are actually in the DataFrame
+    existing_columns = [
+        col for col in desired_columns if col in segment_rankings_df.columns
+    ]
+    # Append any extra columns that are not explicitly ordered
+    remaining_columns = [
+        col for col in segment_rankings_df.columns if col not in existing_columns
+    ]
+
+    segment_rankings_df = segment_rankings_df[existing_columns + remaining_columns]
+
+    print(segment_rankings_df)
+    predictions_out = out_dir / "segment_rankings.csv"
+    segment_rankings_df.to_csv(predictions_out, index=False)
+    print(predictions_out.resolve())
 
     # # plot agg scores/peaks for each query label for fun/analysis
     # for query_label, query_label_df in mean_df.groupby("query_label"):
