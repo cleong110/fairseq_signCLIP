@@ -92,7 +92,7 @@ def plot_scores_by_query(
     query_id_col: str = "query_id",
     label_col: str = "query_label",
     title: str = "Scores by Query",
-    palette: str | None = None,  # Plotly handles colors automatically
+    palette: list[str] | None = None,
     peaks_df: pd.DataFrame | None = None,
     height_line: float | None = None,
     max_legend_allowed: int = 10,
@@ -101,62 +101,94 @@ def plot_scores_by_query(
     Interactive Plotly version of scores plot:
     - One line per query_id
     - Consistent colors across shared query_label
-    - Optional peak markers
-    - Horizontal threshold line
+    - Optional peak markers colored by label
+    - Horizontal threshold as y-axis tick
     - Legend filtering
+    - X-axis shows mm:ss using datetime64[ns] anchored at zero
     """
+    df = df.copy()
+    df["x_time"] = pd.to_datetime(df[x_col], unit="ms")
+
+    if peaks_df is not None and not peaks_df.empty:
+        peaks_df = peaks_df.copy()
+        peaks_df["x_time"] = pd.to_datetime(peaks_df[x_col], unit="ms")
+
     # Default threshold line
     if height_line is None:
         height_line = df[y_col].mean()
 
-    # Plotly line figure
+    color_by = label_col if df[label_col].nunique() > 1 else query_id_col
+
+    # Generate line plot
     fig = px.line(
         df,
-        x=x_col,
+        x="x_time",
         y=y_col,
-        color=label_col if df[label_col].nunique() > 1 else query_id_col,
+        color=color_by,
         line_dash=query_id_col if query_id_col else None,
         title=title,
+        color_discrete_sequence=palette or px.colors.qualitative.Plotly,
     )
 
-    # Add horizontal reference line
+    # Extract color mapping from the line traces
+    label_to_color = {}
+    for trace in fig.data:
+        if hasattr(trace, "legendgroup"):
+            label_to_color[trace.legendgroup] = trace.line.color
+
+    # Add peaks with matching colors
+    if peaks_df is not None and not peaks_df.empty:
+        for label, group in peaks_df.groupby(label_col):
+            fig.add_trace(
+                go.Scatter(
+                    x=group["x_time"],
+                    y=group[y_col],
+                    mode="markers",
+                    marker=dict(
+                        symbol="x", size=10, color=label_to_color.get(label, "black")
+                    ),
+                    name=f"Peaks: {label}",
+                    showlegend=False,
+                )
+            )
+
+    # Add horizontal threshold line
+    # how to add hline with annotation: https://community.plotly.com/t/how-to-add-a-single-tick-value-to-default-ticks-on-an-axis/45621/3
     fig.add_hline(
         y=height_line,
         line_dash="dash",
         line_color="gray",
-        annotation_text="Threshold",
-        annotation_position="top left",
+        annotation_text=f"Threshold<br>{height_line:.2f}",
+        annotation_position="right",
     )
 
-    # Add peak markers if provided
-    if peaks_df is not None and not peaks_df.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=peaks_df[x_col],
-                y=peaks_df[y_col],
-                mode="markers",
-                marker=dict(symbol="x", size=10, color="black"),
-                name="Peaks",
-                showlegend=False,
-            )
-        )
+    # Axis formatting
+    existing_yticks = list(fig.layout.yaxis.tickvals or [])
+    if height_line not in existing_yticks:
+        existing_yticks.append(height_line)
+    existing_yticks = sorted(existing_yticks)
 
-    # Axis labels
-    x_axis_label = " ".join(xl.capitalize() for xl in x_col.split("_"))
+    # Update layout
     fig.update_layout(
-        xaxis_title=x_axis_label,
+        xaxis_title="Time (mm:ss)",
         yaxis_title=y_col.capitalize(),
         legend_title=label_col,
+        xaxis=dict(tickformat="%M:%S"),
+        yaxis=dict(
+            # tickvals=existing_yticks,
+            # ticktext=[
+            #     f"{v:.1f}" if v != height_line else f"{v:.1f} (threshold)"
+            #     for v in existing_yticks
+            # ],
+        ),
     )
 
-    # Optionally trim legend if too many query_ids
-    if query_id_col in df.columns:
-        if df[query_id_col].nunique() > max_legend_allowed:
-            # Keep only label_col values
-            valid_labels = set(df[label_col].astype(str).unique())
-            fig.for_each_trace(
-                lambda trace: trace.update(showlegend=trace.name in valid_labels)
-            )
+    # Trim legend if too many labels
+    if query_id_col in df.columns and df[query_id_col].nunique() > max_legend_allowed:
+        valid_labels = set(df[label_col].astype(str).unique())
+        fig.for_each_trace(
+            lambda trace: trace.update(showlegend=trace.name in valid_labels)
+        )
 
     return fig
 
@@ -402,13 +434,17 @@ def full_df_analysis(
 
         mean_out_html = out_dir / f"{out_stem}_{labels_joined}_mean.html"
         mean_out_pdf = out_dir / f"{out_stem}_{labels_joined}_mean.pdf"
+        mean_out_png = out_dir / f"{out_stem}_{labels_joined}_mean.png"
 
         # Save interactive HTML
         fig.write_html(str(mean_out_html))
 
         fig.write_image(str(mean_out_pdf))
+        fig.write_image(str(mean_out_png))
         print(mean_out_pdf.resolve())
-        if "GOD" == labels[0] and len(labels) == 1:
+        print(mean_out_png.resolve())
+
+        if len(labels) > 1:
             exit()
 
     segment_rankings_df = rank_segments(
