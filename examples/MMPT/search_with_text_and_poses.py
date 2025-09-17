@@ -8,12 +8,12 @@ import pandas as pd
 from pose_format import Pose
 from mmpt.models import MMPTModel
 import matplotlib.pyplot as plt
-import uuid
 import time
+import logging
 
 from sign_language_gloss_utils.glosses.text_utils import (
     get_glosses_set_from_text,
-    preprocess_text,
+    preprocess_text as lemmatize,
 )
 from contextlib import contextmanager
 
@@ -21,19 +21,13 @@ import os
 from tqdm import tqdm
 from functools import cache
 
-from analyze_scores import (
-    aggregate_label_by_queryid,
-    group_and_aggregate_by_label,
-    find_peaks_in_df,
-)
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow C++ backend logs
 os.environ["GLOG_minloglevel"] = "3"  # Suppress GLOG messages from XLA/CUDA
 
-# import warnings
-# warnings.filterwarnings("ignore")           # Suppress Python warnings
+import warnings
 
-import logging
+warnings.filterwarnings("ignore")  # Suppress Python warnings
 
 
 logging.getLogger("tensorflow").setLevel(
@@ -50,7 +44,11 @@ except ImportError:
     pass
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,  # <— this overwrites any prior logging setup
+)
 logger = logging.getLogger(__name__)
 
 
@@ -214,6 +212,10 @@ model_configs = [
         "semantic-search/embed_with_asl_finetune_checkpoint_best",
     ),
     # size mismatch for video_encoder.bert.embeddings.word_embeddings.weight: copying a param with shape torch.Size([28996, 768]) from checkpoint, the shape in current model is torch.Size([30522, 768]).
+    # runs/signclip_embed/asl_citizen_finetune_checkpoint_best/checkpoint_best.pt:       Key: mmmodel.video_encoder.bert.embeddings.word_embeddings.weight (Tensor) shape: (28996, 768) dtype: torch.float32
+    # runs/signclip_embed/asl_citizen_finetune_checkpoint_best/checkpoint_best.pt:       Key: mmmodel.text_encoder.embeddings.word_embeddings.weight (Tensor) shape: (28996, 768) dtype: torch.float32
+    # https://huggingface.co/google-bert/bert-base-uncased?show_file_info=model.safetensors: bert.embeddings.word_embeddings.weight 	[30 522, 768]
+    # https://huggingface.co/google-bert/bert-base-multilingual-cased?show_file_info=model.safetensors: bert.embeddings.word_embeddings.weight 	[119 547, 768]
     # ("asl_finetune_checkpoint_best_uncased",
     #     "semantic-search/embed_with_asl_finetune_checkpoint_best_and_bert_uncased"),
     ("baseline_temporal", "semantic-search/embed_with_baseline_temporal"),
@@ -346,7 +348,7 @@ def preprocess_text(text, model_name="default"):
     return caps, cmasks
 
 
-def embed_pose(pose, model_name="default"):
+def embed_pose(pose, model_name="default", max_frames=None):
     model_info = get_model(model_name)
     model = model_info["model"]
 
@@ -356,7 +358,7 @@ def embed_pose(pose, model_name="default"):
 
     pose_frames_l = []
     for p in poses:
-        pose_frames = preprocess_pose(p)
+        pose_frames = preprocess_pose(p, max_frames=max_frames)
         pose_frames_l.append(pose_frames)
 
     # Batch padding
@@ -453,17 +455,17 @@ def score_pose_and_text_batch(pose, text, model_name="default"):
 
 
 @cache
-def embed_either_format(input_item: SignCLIPEmbeddable) -> np.ndarray:
+def embed_either_format(input_item: SignCLIPEmbeddable, max_frames=None) -> np.ndarray:
     if isinstance(input_item, Path):
-        return embed_pose(Pose.read(input_item.read_bytes()))
+        return embed_pose(Pose.read(input_item.read_bytes()), max_frames=max_frames)
     if isinstance(input_item, str):
         return embed_text(f"<en> <ase> {input_item}")
     elif isinstance(input_item, Pose):
-        return embed_pose(input_item)
+        return embed_pose(input_item, max_frames=max_frames)
 
 
 def score_either_format(query: SignCLIPEmbeddable, target: SignCLIPEmbeddable):
-    query_embed = embed_either_format(query)
+    query_embed = embed_either_format(query, max_frames=MAX_FRAMES_DEFAULT)
     second_embed = embed_either_format(target)
     score = np.matmul(query_embed, second_embed.T).squeeze()
     return float(score)
@@ -492,13 +494,62 @@ def load_pose(
 
 @cache
 def load_window_embedding(
-    pose_path: Path, start_time_ms: int | None = None, end_time_ms: int | None = None
-):
-    return embed_pose(
-        load_pose(
-            pose_path=pose_path, start_time_ms=start_time_ms, end_time_ms=end_time_ms
+    pose_path: Path,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+) -> np.ndarray:
+    """
+    Load embeddings for a pose window. If a cached parquet file of embeddings exists,
+    load from there. Otherwise, compute embeddings, save them for future use, and return.
+
+    Multiple windows per pose file are supported; the parquet grows as new windows are added.
+    """
+    parquet_path = pose_path.with_suffix(".window_embeddings.parquet")
+
+    if parquet_path.exists():
+        df = pd.read_parquet(
+            parquet_path, columns=["start_time_ms", "end_time_ms", "embedding"]
         )
+
+        # Try to find matching row for this window
+        mask = (df["start_time_ms"] == start_time_ms) & (
+            df["end_time_ms"] == end_time_ms
+        )
+        if mask.any():
+            logger.info("Loading cached embeddings from %s", parquet_path)
+            row = df.loc[mask].iloc[0]
+            return np.array(row["embedding"], dtype=np.float32).reshape(1, -1)
+
+    # Fall back to computing embeddings
+    logger.info(
+        "No cached embeddings found. Computing embeddings for %s [%s - %s]",
+        pose_path,
+        start_time_ms,
+        end_time_ms,
     )
+    poses = load_pose(
+        pose_path=pose_path, start_time_ms=start_time_ms, end_time_ms=end_time_ms
+    )
+    embeddings = embed_pose(poses)  # shape (1, 768)
+
+    # Flatten to 1D list for storage
+    row = {
+        "start_time_ms": start_time_ms,
+        "end_time_ms": end_time_ms,
+        "embedding": embeddings.flatten().tolist(),
+    }
+
+    # Append to parquet (read, concat, write back)
+    if parquet_path.exists():
+        df = pd.read_parquet(parquet_path)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+
+    logger.debug(f"Saving updated embeddings {embeddings.shape} to %s", parquet_path)
+    df.to_parquet(parquet_path, index=False)
+
+    return embeddings
 
 
 def get_sliding_window_frame_ranges(
@@ -542,7 +593,7 @@ def score_windows_over_pose(
         List of tuples: (window_start_ms, window_end_ms, score)
     """
     query_scores = defaultdict(list)
-    query_embed = embed_either_format(query)
+    query_embed = embed_either_format(query, max_frames=MAX_FRAMES_DEFAULT)
 
     for window_start, window_end in tqdm(
         get_sliding_window_frame_ranges(
@@ -580,6 +631,7 @@ def score_windows_over_pose(
 def get_pose_queries(query_glosses, dataset_df, samples_per_gloss=5):
     gloss_df = dataset_df[dataset_df["GLOSS"].isin(query_glosses)].copy()
     # Group by gloss and sample
+    # TODO: check if the pose is longer than 256 frames
     sampled_df = gloss_df.groupby("GLOSS", group_keys=False).apply(
         lambda x: x.sample(min(len(x), samples_per_gloss), random_state=42)
     )
@@ -625,6 +677,7 @@ def score_with_text_and_gloss_keywords(
     results_dir,
     eng_text_label="",
     samples_per_gloss=5,
+    include_lemmas=True,
 ):
     if not pose_path.is_file():
         raise FileNotFoundError(f"Pose file not found: {pose_path}")
@@ -633,9 +686,13 @@ def score_with_text_and_gloss_keywords(
     dataset_vocab = set(dataset_df["GLOSS"].unique())
     logger.info(f"Loaded dataset with vocab of length: {len(dataset_vocab)}")
 
-    query_glosses = get_glosses_set_from_text(
-        text_query, dataset_vocab, remove_stopwords=True
-    )
+    if not include_lemmas:
+        query_glosses = get_glosses_set_from_text(
+            text_query, dataset_vocab, remove_stopwords=True
+        )
+    else:
+        query_glosses = set(lemmatize(text_query))
+
     logger.info(f"Glosses found for '{text_query}': {query_glosses}")
 
     pose_queries = list(
@@ -643,7 +700,11 @@ def score_with_text_and_gloss_keywords(
     )
     text_queries = get_text_queries(query_glosses)
 
-    queries = text_queries + pose_queries
+    queries = (
+        text_queries + pose_queries
+    )  # + [("full_text_query", text_query[:100],text_query)]
+
+    logger.info(f"Total Queries: {len(queries)}")
 
     for q in queries:
         logger.info(f"Gloss/Keyword Query: {q}")
@@ -651,8 +712,9 @@ def score_with_text_and_gloss_keywords(
     full_pose = load_pose(pose_path)
     duration_ms = 1000 * len(full_pose.body.data) / full_pose.body.fps
 
-    run_dir = results_dir / model_to_use / pose_path.stem / str(uuid.uuid4())
-    queries_dir = run_dir / "queries"
+    # run_dir = results_dir / model_to_use / pose_path.stem / str(uuid.uuid4())
+
+    queries_dir = results_dir / "queries"
     queries_dir.mkdir(parents=True, exist_ok=True)
 
     all_query_score_dfs = []
@@ -661,12 +723,12 @@ def score_with_text_and_gloss_keywords(
         query_start = start_time_ms if start_time_ms is not None else 0
         query_end = end_time_ms if end_time_ms is not None else duration_ms - 1
 
-        logger.info(
-            f"Running query '{query_id}' from {query_start}ms to {query_end:.2f}ms"
+        logger.debug(
+            f"Running query '{query_id}' with label {query_label} from {query_start}ms to {query_end:.2f}ms"
         )
 
         query_dir = queries_dir / query_id
-        query_dir.mkdir(exist_ok=True)
+        query_dir.mkdir(exist_ok=True, parents=True)
 
         out_png = (
             query_dir
@@ -709,7 +771,12 @@ def score_with_text_and_gloss_keywords(
 
         all_query_score_dfs.append(query_scores_df)
 
-    all_query_scores_df = pd.concat(all_query_score_dfs)
+    # TODO: what if these are empty
+    if len(all_query_score_dfs) > 0:
+        all_query_scores_df = pd.concat(all_query_score_dfs)
+    else:
+        all_query_scores_df = pd.DataFrame()
+
     all_query_scores_df["text_query"] = text_query
     all_query_scores_df["target_video_name"] = pose_path.name
     all_query_scores_df["samples_per_gloss"] = samples_per_gloss
@@ -783,15 +850,20 @@ def main():
     parser.add_argument(
         "--height_multiplier",
         type=float,
-        # default="god",
         help="Passed to the find_peaks function for finding 'hits'",
     )
 
     parser.add_argument(
         "--density_weight",
         type=float,
-        # default="god",
         help="How much to weight hit density. ",
+    )
+
+    parser.add_argument(
+        "--samples-per-gloss",
+        type=int,
+        default=5,
+        help="Samples per gloss",
     )
 
     parser.add_argument(
@@ -826,44 +898,42 @@ def main():
 
     args = parser.parse_args()
 
-    # ----------- Load Query Text from JSON
-    if args.query_json is None:
-        # try looking
-        # there's multiple extensions
-        pose_path_true_stem = args.pose_path.name.split(".")[0]
-        possible_transcript_json = (
-            args.pose_path.parent / f"{pose_path_true_stem}.transcripts.json"
-        )
-        if possible_transcript_json.is_file():
-            transcript_json_path = possible_transcript_json
-    else:
-        transcript_json_path = args.query_json
-
-    transcripts = []
-    if transcript_json_path is not None:
-        with open(transcript_json_path) as f:
-            transcripts = json.load(f)
-
     segment_indices = []
     text_queries = []
-    for seg_idx, transcript_dict in enumerate(transcripts):
-        q = transcript_dict["text"]
-        text_queries.append(q)
-        segment_indices.append(seg_idx)
-        logger.info(f"Segment {seg_idx} query: {q}")
-    run_dir = args.results_dir / args.model / args.pose_path.stem / f"{uuid.uuid4()}"
 
-    if args.eng is None:
-        text_queries.append("")
-        segment_indices.append(9999)
+    run_dir = (
+        args.results_dir
+        / args.model
+        / f"samplespergloss_{args.samples_per_gloss}"
+        / f"start_{args.start_time_ms}_end_{args.end_time_ms}"
+        / f"windowsize{args.window_size_ms}_step{args.step_size_ms}"
+        / args.pose_path.stem
+        # / f"{uuid.uuid4()}"
+    )
+
+    logger.info(f"Run Dir: {run_dir}")
+
+    if args.eng is not None:
+        for eng_query in args.eng.split(","):
+            text_queries.append(eng_query)
+            segment_indices.append(9999)
+            logger.info(f"Text Queries from CLI: {text_queries}")
+
     else:
-        text_queries.append(args.eng)
-        segment_indices.append(9999)
+        text_queries.append("")
+        segment_indices.append(-1)
 
+    # --------------- Iterate over segments
     for seg_idx, text_query in zip(segment_indices, text_queries):
-        query_dir = run_dir / f"seg_idx{seg_idx}"
-        query_dir.mkdir(exist_ok=True, parents=True)
-        logger.info(f"Query {seg_idx}:\n{text_query}\n{query_dir}")
+        # print(f"Query for segment #{seg_idx}:\n\tq: {text_query}\n")
+        if seg_idx < 9999 or text_query == "":
+            continue
+        segment_dir = run_dir / f"seg_idx{seg_idx}"
+        segment_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(
+            f"Query for segment #{seg_idx}:\n\tq: {text_query}\n\tout: {segment_dir}"
+        )
+
         if not text_query:
             continue
         # ----------- Get "Keyword" scores
@@ -877,59 +947,54 @@ def main():
                 window_size_ms=args.window_size_ms,
                 step_size_ms=args.step_size_ms,
                 model_to_use=args.model,
-                results_dir=query_dir,
+                results_dir=segment_dir,
                 eng_text_label=args.eng,
+                samples_per_gloss=args.samples_per_gloss,
             )
 
         run_dir.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(query_dir / "all_scores.parquet")
-        logger.info(f"Saved all scores to {run_dir / 'all_scores.parquet'}")
 
-        # ----------- Aggregate by label, then by query ID to get one signal for each label
-        agg_df = group_and_aggregate_by_label(df)
-        logger.info("agg_df:")
-        logger.info(agg_df)
+        pose = Pose.read(args.pose_path.read_bytes())
 
-        # ------------Find Peaks
-        mean_score = agg_df["score"].mean()
-        agg_peaks_df = find_peaks_in_df(
-            agg_df,
-            group_col="query_label",
-            prominence=args.prominence,
-            height=mean_score,
-        )
+        pose_info = {
+            "fps": pose.body.fps,
+            "frame_count": pose.body.data.shape[0],
+            "people": pose.body.data.shape[1],
+            "keypoints": pose.body.data.shape[2],
+            "path": str(args.pose_path),
+        }
+        with open(run_dir / "pose_info.json", "w") as f:
+            json.dump(pose_info, f)
 
-        # ------------ Rank Segments by match count and density
-        # load in the segments from the json
-        # for each segment
-        # hit_count from find_peaks
-        hit_count = len(agg_peaks_df)
-        # density_weight
-        density_weight = args.density_weight
-
-        # hits per unit length
-
-        # relevance = score = H + 10 * D
-
-        # sort by relevance
-
-        # ------------- Write out Predictions: seg_idx, rank
-        # TODO: fix off by one error in vref annotations
-
-        # -------------- Grade Predictions
-        # not here. Other script.
+        df["query_group_score_time"] = t
+        df["query_seg_idx"] = seg_idx
+        df.to_parquet(segment_dir / "all_scores.parquet")
+        logger.info(f"Saved all scores to {segment_dir / 'all_scores.parquet'}")
 
 
 if __name__ == "__main__":
     main()
 
-# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "test_data/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 5000 --end_time_ms 60000 --step_size_ms 10 --window_size_ms 1500 --eng "god life heaven sky earth" --model "asl_finetune_checkpoint_best"
 
+# Conda env:
+# conda activate /opt/home/cleong/envs/signclip_inference/
+# python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "test_data/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 5000 --end_time_ms 60000 --step_size_ms 10 --window_size_ms 1500 --eng "god life heaven sky earth" --model "asl_finetune_checkpoint_best"
 
 
 # find test_data/ -name "*.pose"|parallel -j2 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 10 --window_size_ms 1000 --model "asl_finetune_checkpoint_best"
 # find test_data/ -name "*.pose"|parallel -j2 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 100 --window_size_ms 3000 --eng "god" --model "asl_finetune_checkpoint_best"
 
-# just God creates the world
+# just God creates the world, and also search for "refrigerator"
 # find test_data/ -name "*passage _ god creates the world.pose-mediapipe*.pose"|parallel -j1 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 100 --window_size_ms 1000 --eng "refrigerator" --model "asl_finetune_checkpoint_best"
 
+
+# add in 15 queries/gloss and search God Creates the World, and search with step 200
+# find test_data/ -name "*passage _ god creates the world.pose-mediapipe*.pose"|parallel -j1 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 200 --window_size_ms 1000 --eng "refrigerator,god,heaven,day,earth" --model "asl_finetune_checkpoint_best" --samples-per-gloss 15
+
+# Same, but just The First Man and Womand Disobey God
+# find /data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ -name "*passage _ *first*man*and*woman*disobey*.pose-mediapipe*.pose"|parallel -j1 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 200 --window_size_ms 1000 --eng "refrigerator" --model "asl_finetune_checkpoint_best" --samples-per-gloss 15
+
+
+# (signclip_inference) root@16-cpu-128g-1gshared-exclgpu:/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT# python search_with_text_and_poses.py --eng "SILVER ISRAEL MAN FAMILY SON COME PEOPLE SELECT TENT ENEMY HIDE BURN TROUBLE BAR BRING" --samples-per-gloss 16 --pose_path "/data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-033-ase-2-passage _ israel fails to conquer ai.pose-mediapipe.pose" --start_time_ms 0 --step_size_ms 200 --window_size_ms 1000 --model "asl_finetune_checkpoint_best"
+
+# python search_with_text_and_poses.py --eng "YAHWEH GOD" --samples-per-gloss 26 --pose_path "/data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 0 --step_size_ms 100 --window_size_ms 500 --model "asl_finetune_checkpoint_best"
