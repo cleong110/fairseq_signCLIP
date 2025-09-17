@@ -1,4 +1,3 @@
-from collections import defaultdict
 import json
 from pathlib import Path
 import argparse
@@ -10,80 +9,6 @@ import plotly.io as pio
 
 pio.kaleido.scope.mathjax = None  # https://github.com/plotly/plotly.py/issues/3469
 
-# def plot_scores_by_query(
-#     df,
-#     x_col="window_midpoint_ms",
-#     y_col="score",
-#     query_id_col="query_id",
-#     label_col="query_label",
-#     title="Scores by Query",
-#     figsize=(10, 6),
-#     palette="tab10",
-#     peaks_df=None,
-#     height_line: float | None = None,
-#     max_legend_allowed=10,
-# ):
-#     """
-#     Plot scores over time, one trace per query_id,
-#     using same color for shared query_label.
-
-#     Optionally, overlay peak points if `peaks_df` is provided.
-#     """
-#     fig, ax = plt.subplots(figsize=figsize)
-
-#     if height_line is None:
-#         height_line = df[y_col].mean()
-#     ax.axhline(height_line, ls="--")
-
-#     # show_legend = df[query_id_col].nunique() <= max_legend_allowed
-#     sns.lineplot(
-#         data=df,
-#         x=x_col,
-#         y=y_col,
-#         hue=label_col if len(df[label_col].unique()) > 1 else query_id_col,
-#         style=query_id_col if query_id_col else None,
-#         estimator=None,
-#         palette=palette,
-#         # legend="full" if show_legend else False,
-#         legend="full",
-#         linewidth=1,
-#         alpha=0.8,
-#         ax=ax,
-#     )
-
-#     if peaks_df is not None and not peaks_df.empty:
-#         sns.scatterplot(
-#             data=peaks_df,
-#             x=x_col,
-#             y=y_col,
-#             hue=label_col,
-#             palette=palette,
-#             marker="X",
-#             s=60,
-#             ax=ax,
-#             legend=False,  # avoid duplicate legend
-#         )
-
-#     # Only keep entries that match the label_col values
-#     if query_id_col in df.columns and df[query_id_col].nunique() > max_legend_allowed:
-#         handles, labels = ax.get_legend_handles_labels()
-#         label_values = df[label_col].unique().astype(str)
-
-#         filtered = [(h, l) for h, l in zip(handles, labels) if l in label_values]
-
-#         if filtered:
-#             ax.legend(*zip(*filtered), title=label_col)
-#         else:
-#             ax.legend_.remove()
-
-#     # ax.set_title(title)
-#     x_axis_label = " ".join(xl.capitalize() for xl in x_col.split("_"))
-#     ax.set_xlabel(x_axis_label)
-#     ax.set_ylabel(y_col.capitalize())
-#     fig.tight_layout()
-
-#     return fig
-
 
 def plot_scores_by_query(
     df: pd.DataFrame,
@@ -91,7 +16,7 @@ def plot_scores_by_query(
     y_col: str = "score",
     query_id_col: str = "query_id",
     label_col: str = "query_label",
-    title: str = "Scores by Query",
+    title: str | None = None,
     palette: list[str] | None = None,
     peaks_df: pd.DataFrame | None = None,
     height_line: float | None = None,
@@ -168,11 +93,14 @@ def plot_scores_by_query(
         existing_yticks.append(height_line)
     existing_yticks = sorted(existing_yticks)
 
+    yaxis_title = " ".join(s.capitalize() for s in y_col.split("_"))
+    legend_title = " ".join(s.capitalize() for s in label_col.split("_"))
+
     # Update layout
     fig.update_layout(
         xaxis_title="Time (mm:ss)",
-        yaxis_title=y_col.capitalize(),
-        legend_title=label_col,
+        yaxis_title=yaxis_title,
+        legend_title=legend_title,
         xaxis=dict(tickformat="%M:%S"),
         yaxis=dict(
             # tickvals=existing_yticks,
@@ -189,6 +117,12 @@ def plot_scores_by_query(
         fig.for_each_trace(
             lambda trace: trace.update(showlegend=trace.name in valid_labels)
         )
+
+    # put the legend on top
+
+    fig.update_layout(
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
 
     return fig
 
@@ -288,60 +222,6 @@ def count_peaks_in_range(peaks_df: pd.DataFrame, start_ms: int, end_ms: int) -> 
     return len(in_range)
 
 
-def rank_segments(
-    segments_ms_windows: list[tuple[int, int]], peaks_df, density_weight: float = 10.0
-) -> pd.DataFrame:
-    """
-    Rank segment windows by relevance based on number and density of peaks.
-
-    Args:
-        segments_ms_windows: List of (start_ms, end_ms) tuples.
-        peaks_df: DataFrame containing peak timestamps.
-        density_weight: Weighting factor for peak density.
-
-    Returns:
-        A DataFrame sorted by descending relevance score, with columns:
-        ['seg_idx', 'start_ms', 'end_ms', 'num_peaks', 'density', 'relevance_score', 'rank']
-    """
-    seg_relevance_data = defaultdict(list)
-
-    print(peaks_df.columns)
-
-    for seg_idx, (start_ms, end_ms) in enumerate(segments_ms_windows):
-        num_peaks = count_peaks_in_range(peaks_df, start_ms=start_ms, end_ms=end_ms)
-
-        window_length = end_ms - start_ms
-        if window_length <= 0:
-            print(f"Warning: Skipping invalid window ({start_ms}, {end_ms})")
-            continue
-
-        peak_density = num_peaks / window_length
-        relevance_score = num_peaks + peak_density * density_weight
-
-        print(
-            f"Seg #{seg_idx}: peaks={num_peaks}, window={window_length}ms, "
-            f"density={peak_density:.4f}, score={relevance_score:.4f}"
-        )
-
-        seg_relevance_data["seg_idx"].append(seg_idx)
-        seg_relevance_data["start_ms"].append(start_ms)
-        seg_relevance_data["end_ms"].append(end_ms)
-        seg_relevance_data["num_peaks"].append(num_peaks)
-        seg_relevance_data["density"].append(peak_density)
-        seg_relevance_data["relevance_score"].append(relevance_score)
-
-    df = pd.DataFrame(seg_relevance_data)
-
-    if df.empty:
-        print("Warning: No valid segments found.")
-        return df
-
-    df = df.sort_values(by="relevance_score", ascending=False).reset_index(drop=True)
-    df["rank"] = df.index + 1  # Rank starting from 1
-
-    return df
-
-
 def full_df_analysis(
     df_path: Path,
     out_dir: Path | None = None,
@@ -349,62 +229,62 @@ def full_df_analysis(
     prominence: float = 1.0,
     height_multiplier: float = 1.1,
     density_weight: float = 10.0,
+    filter_eng: bool = False,
 ):
     if out_dir is None:
         out_dir = df_path.parent
     out_stem = df_path.stem
 
-    transcripts = None
-    if query_json is not None:
-        query_json_path = query_json
-        with open(query_json_path) as f:
-            transcripts = json.load(f)
-    else:
-        query_json_paths = list(df_path.parent.parent.glob("*.transcripts.json"))
-        if len(query_json_paths) > 0:
-            query_json_path = query_json_paths[0]
-            print(f"Loading JSON from {query_json_path}")
-            with open(query_json_path) as f:
-                transcripts = json.load(f)
-        else:
-            query_json_path = None
+    print("Analyzing {df_path}")
 
     with open(df_path.parent.parent / "pose_info.json") as f:
         pose_info = json.load(f)
     print(pose_info)
 
-    segments_ms_windows = []
-    true_seg_idx = None
-    original_query = None
-    if transcripts is not None:
-        for seg_idx, transcript in enumerate(transcripts):
-            if df_path.parent.name == f"seg_idx{seg_idx}":
-                true_seg_idx = seg_idx
-                original_query = transcript["text"]
-                print(f"TRUE SEGMENT INDEX: {true_seg_idx}")
-
-            start_frame = transcript["start_frame"]
-            end_frame = transcript["end_frame"]
-
-            start_ms = 1000 * start_frame / pose_info["fps"]
-            end_ms = 1000 * end_frame / pose_info["fps"]
-
-            print(
-                f"seg {seg_idx} goes from {start_frame} ({start_ms} ms) to {end_frame} ({end_ms} ms)"
-            )
-            window = (start_ms, end_ms)
-            segments_ms_windows.append(window)
-
     df = pd.read_parquet(df_path)
+    print(df["query_label"].unique())
     df["time_hms"] = pd.to_timedelta(df["window_midpoint_ms"], unit="ms")
+
+    if filter_eng:
+        df = df[~df["query_id"].str.contains("(eng)", regex=False)]
+        if len(df) == 0:
+            raise ValueError(
+                f"Filtering out English queries leaves our scores empty - df len(): {len(df)}"
+            )
 
     agg_by_label_dfs = group_and_aggregate_by_label(df, agg_fn="mean")
 
     all_mean_df = pd.concat(agg_by_label_dfs, ignore_index=True)
 
+    subset_custom_looking_deletethis = [
+        "GOD",
+        "KNOW",
+        "TREE",
+        "WIFE",
+        "HEAD",
+        "PAIN",
+        "MAN",
+        "DAY",
+        "HEAVEN",
+        "EARTH",
+    ]
+
+    if any(
+        l in all_mean_df["query_label"].unique().tolist()
+        # for l in ["GOD", "HEAVEN", "EARTH", "DAY"]
+        for l in subset_custom_looking_deletethis
+    ):
+        print("found it")
+        custom_mean_df = all_mean_df[
+            all_mean_df["query_label"].isin(subset_custom_looking_deletethis)
+        ]
+        print(custom_mean_df)
+        agg_by_label_dfs.append(custom_mean_df)
+
     agg_by_label_dfs.append(all_mean_df)
     for agg_df in agg_by_label_dfs:
         labels = agg_df["query_label"].unique()
+
         # scores_with_these_labels_df = df[df["query_label"].isin(labels)]
         labels_joined = "_".join(labels)
         print(agg_df.columns)
@@ -427,14 +307,25 @@ def full_df_analysis(
             y_col="score",
             query_id_col=None,
             label_col="query_label",
-            title="Mean Aggregated Scores by Query Label",
+            title=None,  # "Mean Aggregated Scores by Query Label",
             peaks_df=peaks_for_mean_df,
             height_line=height,
         )
 
-        mean_out_html = out_dir / f"{out_stem}_{labels_joined}_mean.html"
-        mean_out_pdf = out_dir / f"{out_stem}_{labels_joined}_mean.pdf"
-        mean_out_png = out_dir / f"{out_stem}_{labels_joined}_mean.png"
+        settings_string = f"prominence_{prominence}_heightmult_{height_multiplier}"
+        if filter_eng:
+            settings_string = f"{settings_string}_NoEnglish"
+
+        labels_joined_out_dir = out_dir / "peaks" / settings_string / f"{labels_joined}"
+        labels_joined_out_dir.mkdir(parents=True, exist_ok=True)
+
+        mean_out_html = labels_joined_out_dir / f"{out_stem}_{labels_joined}_mean.html"
+        mean_out_pdf = labels_joined_out_dir / f"{out_stem}_{labels_joined}_mean.pdf"
+        mean_out_png = labels_joined_out_dir / f"{out_stem}_{labels_joined}_mean.png"
+
+        peaks_for_mean_df.to_csv(
+            labels_joined_out_dir / f"{out_stem}_{labels_joined}_peaks.csv", index=False
+        )
 
         # Save interactive HTML
         fig.write_html(str(mean_out_html))
@@ -443,45 +334,6 @@ def full_df_analysis(
         fig.write_image(str(mean_out_png))
         print(mean_out_pdf.resolve())
         print(mean_out_png.resolve())
-
-        if len(labels) > 1:
-            exit()
-
-    segment_rankings_df = rank_segments(
-        segments_ms_windows, peaks_for_mean_df, density_weight
-    )
-
-    if true_seg_idx is not None and original_query is not None:
-        print(true_seg_idx, original_query)
-        video_id = query_json_path.name.split(".")[0]
-        segment_rankings_df["video_id"] = video_id
-        segment_rankings_df["query_text"] = original_query
-
-    desired_columns = [
-        "video_id",
-        "query_text",
-        "rank",
-        "seg_idx",
-        "start_ms",
-        "end_ms",
-        "num_peaks",
-        "density",
-        "relevance_score",
-    ]
-    existing_columns = [
-        col for col in desired_columns if col in segment_rankings_df.columns
-    ]
-    remaining_columns = [
-        col for col in segment_rankings_df.columns if col not in existing_columns
-    ]
-    segment_rankings_df = segment_rankings_df[existing_columns + remaining_columns]
-    segment_rankings_df["path_to_results"] = df_path
-
-    print(segment_rankings_df)
-    predictions_out = out_dir / "segment_rankings.csv"
-    segment_rankings_df.to_csv(predictions_out, index=False)
-    print(predictions_out.resolve())
-    return segment_rankings_df
 
 
 def main():
@@ -498,62 +350,60 @@ def main():
     parser.add_argument(
         "--density_weight", type=float, default=10.0, help="Weight hit density"
     )
+    parser.add_argument(
+        "--filter-eng",
+        action="store_true",
+        help="whether to filter out the (eng) queries before finding peaks",
+    )
 
     args = parser.parse_args()
 
     if args.df.is_dir():
-        df_paths = args.df.rglob("*all_scores.parquet")
-        ground_truth_files = list(args.df.glob("*.transcripts.json"))
-        assert len(ground_truth_files) == 1
+        df_paths = list(args.df.rglob("*all_scores.parquet"))
+        # ground_truth_files = list(args.df.glob("*.transcripts.json"))
+        # assert len(ground_truth_files) == 1, f"{args.df} has no ground truth transcripts!"
 
-        # create ground truth CSV at top level
-        # query_text,video_id,seg_idx,start_frame,end_frame,total_frames
-        with open(ground_truth_files[0]) as f:
-            ground_truth_transcripts = json.load(f)
-            ground_truth_dict = defaultdict(list)
-            for seg_idx, transcript in enumerate(ground_truth_transcripts):
-                ground_truth_dict["query_text"].append(transcript["text"])
-                ground_truth_dict["video_id"].append(
-                    ground_truth_files[0].name.split(".")[0]
-                )
-                ground_truth_dict["seg_idx"].append(seg_idx)
-                ground_truth_dict["start_frame"].append(transcript["start_frame"])
-                ground_truth_dict["end_frame"].append(transcript["end_frame"])
-            ground_truth_df = pd.DataFrame(ground_truth_dict)
-            out = args.df / "ground_truth.csv"
-            ground_truth_df.to_csv(out, index=False)
-            print(f"Saved ground truth to {out.resolve()}")
+        # # create ground truth CSV at top level
+        # # query_text,video_id,seg_idx,start_frame,end_frame,total_frames
+        # with open(ground_truth_files[0]) as f:
+        #     ground_truth_transcripts = json.load(f)
+        #     ground_truth_dict = defaultdict(list)
+        #     for seg_idx, transcript in enumerate(ground_truth_transcripts):
+        #         ground_truth_dict["query_text"].append(transcript["text"])
+        #         ground_truth_dict["video_id"].append(
+        #             ground_truth_files[0].name.split(".")[0]
+        #         )
+        #         ground_truth_dict["seg_idx"].append(seg_idx)
+        #         ground_truth_dict["start_frame"].append(transcript["start_frame"])
+        #         ground_truth_dict["end_frame"].append(transcript["end_frame"])
+        #     ground_truth_df = pd.DataFrame(ground_truth_dict)
+        #     out = args.df / "ground_truth.csv"
+        #     ground_truth_df.to_csv(out, index=False)
+        #     print(f"Saved ground truth to {out.resolve()}")
 
     else:
         df_paths = [args.df]
 
-    all_segment_ranking_dfs_list = []
     for df_path in df_paths:
-        segment_rankings_df = full_df_analysis(
+        if "seg_idx9999" not in df_path.parent.name:
+            # print(f"Skipping {df_path}")
+            continue
+        full_df_analysis(
             df_path=df_path,
             out_dir=args.out_dir,
             query_json=args.query_json,
             prominence=args.prominence,
             height_multiplier=args.height_multiplier,
             density_weight=args.density_weight,
+            filter_eng=args.filter_eng,
         )
-        all_segment_ranking_dfs_list.append(segment_rankings_df)
-    all_segment_rankings_df = pd.concat(all_segment_ranking_dfs_list)
-
-    # Drop rows where 'video_id' or 'query_text' is NaN or empty string
-    all_segment_rankings_df = all_segment_rankings_df.dropna(
-        subset=["video_id", "query_text"]
-    )
-    all_segment_rankings_df = all_segment_rankings_df[
-        (all_segment_rankings_df["video_id"].str.strip() != "")
-        & (all_segment_rankings_df["query_text"].str.strip() != "")
-    ]
-
-    if args.df.is_dir():
-        out = args.df / "all_predictions.csv"
-        all_segment_rankings_df.to_csv(out, index=False)
-        print(out.resolve())
 
 
 if __name__ == "__main__":
     main()
+
+# Usage:
+# python analyze_scores.py "/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/asl_finetune_checkpoint_best/samplespergloss_15/start_0_end_None/windowsize1000_step200/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe/" --height_multiplier 1.2
+# OK let's say you previously did find /data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ -name "*passage _ *first*man*and*woman*disobey*.pose-mediapipe*.pose"|parallel -j1 python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "{}" --start_time_ms 0 --step_size_ms 200 --window_size_ms 1000 --eng "refrigerator" --model "asl_finetune_checkpoint_best" --samples-per-gloss 15
+# then you might do:
+# python analyze_scores.py "/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/asl_finetune_checkpoint_best/samplespergloss_15/start_0_end_None/windowsize1000_step200/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-003-ase-3-passage _ the first man and woman disobey god.pose-mediapipe" --height_multiplier 1.2

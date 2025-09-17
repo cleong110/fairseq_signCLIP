@@ -26,11 +26,29 @@ def load_ground_truth(path: Union[str, Path]) -> pd.DataFrame:
 
 
 def load_predictions(path: Union[str, Path]) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if "window_midpoint_ms" not in df.columns or "query_label" not in df.columns:
-        raise ValueError(
-            "Predictions file must have 'query_label' and 'window_midpoint_ms' columns."
+    """Load predictions CSV and ensure required columns exist.
+
+    If the file is empty or missing required columns, return
+    an empty DataFrame with the required columns.
+    """
+    required_columns = ["query_label", "window_midpoint_ms", "score", ]
+
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        logging.warning("File %s is empty. Returning empty DataFrame.", path)
+        return pd.DataFrame(columns=required_columns)
+
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        logging.warning(
+            "Missing required columns %s in file %s. Returning empty DataFrame.",
+            missing_columns,
+            path,
         )
+        return pd.DataFrame(columns=required_columns)
+
     return df
 
 
@@ -58,6 +76,7 @@ def match_predictions(
     preds_df["correct"] = results
     return preds_df
 
+
 def compute_eval_stats(
     evaluated_df: pd.DataFrame,
     gt_df: pd.DataFrame,
@@ -66,6 +85,10 @@ def compute_eval_stats(
     """Compute per-label precision, recall, and F1 score."""
     gt_by_label = gt_df.groupby("Sign")["timestamp_ms"].apply(list).to_dict()
     pred_by_label = evaluated_df.groupby("query_label")
+
+    # print(f"***********")
+    # print(evaluated_df.head())
+    # exit()
 
     all_labels = set(gt_by_label) | set(pred_by_label.groups)
 
@@ -77,6 +100,11 @@ def compute_eval_stats(
             if label in pred_by_label.groups
             else pd.DataFrame(columns=evaluated_df.columns)
         )
+
+        # if len(pred_rows) > 0:
+        #     print("************")
+        #     print(pred_rows["score"].head())
+        #     exit()
         pred_timestamps = pred_rows["window_midpoint_ms"].to_numpy()
         correct_mask = pred_rows["correct"].to_numpy() if not pred_rows.empty else []
 
@@ -94,11 +122,18 @@ def compute_eval_stats(
 
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        f1 = (
+            2 * (precision * recall) / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
 
         stats.append(
             {
                 "query_label": label,
+                "max_peak": pred_rows["score"].max(),
+                "mean_peak": pred_rows["score"].mean(),
+                "min_peak": pred_rows["score"].min(),
                 "predictions_count": len(pred_rows),
                 "ground_truth_count": len(gt_timestamps),
                 "true_positives": tp,
@@ -107,21 +142,34 @@ def compute_eval_stats(
                 "precision": round(precision, 4),
                 "recall": round(recall, 4),
                 "f1": round(f1, 4),
+                
             }
         )
 
     df = pd.DataFrame(stats)
 
     # --- Append TOTAL row ---
+    total_max_peak = df["max_peak"].max()
+    total_mean_peak = df["mean_peak"].mean()
+    total_min_peak = df["min_peak"].min()
+
     total_tp = df["true_positives"].sum()
     total_fp = df["false_positives"].sum()
     total_fn = df["false_negatives"].sum()
     total_preds = df["predictions_count"].sum()
     total_gt = df["ground_truth_count"].sum()
 
-    total_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    total_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    total_f1 = 2 * (total_precision * total_recall) / (total_precision + total_recall) if (total_precision + total_recall) > 0 else 0.0
+    total_precision = (
+        total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    )
+    total_recall = (
+        total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    )
+    total_f1 = (
+        2 * (total_precision * total_recall) / (total_precision + total_recall)
+        if (total_precision + total_recall) > 0
+        else 0.0
+    )
 
     df.loc[len(df)] = {
         "query_label": "TOTAL",
@@ -133,10 +181,12 @@ def compute_eval_stats(
         "precision": round(total_precision, 4),
         "recall": round(total_recall, 4),
         "f1": round(total_f1, 4),
+        "max_peak" : total_max_peak,
+        "mean_peak": total_mean_peak,
+        "min_peak":total_min_peak,
     }
 
     return df
-
 
 
 def main(
@@ -147,7 +197,7 @@ def main(
     logging.info("Loading ground truth from %s", ground_truth_csv)
     gt_df = load_ground_truth(ground_truth_csv)
 
-    logging.info("Loading predictions from %s", predictions_csv)
+    logging.info("Loading predictions from %s", predictions_csv)    
     preds_df = load_predictions(predictions_csv)
 
     logging.info("Evaluating predictions...")

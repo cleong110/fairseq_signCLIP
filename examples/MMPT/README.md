@@ -1,3 +1,39 @@
+# Colin's procedure
+
+# Parsing AVODAH ANNOTATIONS
+https://colab.research.google.com/drive/18fqNDgmFKbFASEj-jYkP4d5QDUifMcjS#scrollTo=vZBZSEWtdtpV
+
+# First you run the search
+python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/fairseq/examples/MMPT/test_data/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 0 --step_size_ms 1000 --window_size_ms 9000 --eng 'refrigerator,god,heaven,day,earth,In the beginning God created the heavens and the earth' --model "asl_finetune_checkpoint_best" --samples-per-gloss 0
+
+python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "/data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-003-ase-3-passage _ the first man and woman disobey god.pose-mediapipe.pose" --start_time_ms 0 --step_size_ms 200 --window_size_ms 1000 --eng "god,know,man,tree" --model "asl_finetune_checkpoint_best" --samples-per-gloss 0
+
+python /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/search_with_text_and_poses.py --pose_path "/data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe.pose" --start_time_ms 0 --step_size_ms 1500 --window_size_ms 3000 --eng "god,know,man,tree" --model "asl_finetune_checkpoint_best" --samples-per-gloss 15
+
+# Analyze scores/find peaks
+Then you run analyze_scores which gives peaks
+Do it with multiple height_multiplier values
+find results/asl_finetune_checkpoint_best/ -mindepth 4 -maxdepth 4 -type d|parallel -j1 python analyze_scores.py "{}" --filter-eng --height_multiplier 1.1
+find results/asl_finetune_checkpoint_best/ -mindepth 4 -maxdepth 4 -type d|parallel -j1 python analyze_scores.py "{}" --filter-eng --height_multiplier 1.2
+find results/asl_finetune_checkpoint_best/ -mindepth 4 -maxdepth 4 -type d|parallel -j1 python analyze_scores.py "{}" --filter-eng --height_multiplier 1.3
+
+# then evaluate_peaks.py
+```
+find "/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/asl_finetune_checkpoint_best/" -wholename "*samplespergloss*ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe*peaks.csv"|parallel -j10 python evaluate_peaks.py --ground_truth "CBT-001-ase-3-Passage_God_Creates_the_World.gloss-annotations.csv" --predictions "{}"
+```
+
+Then you do like 
+(pose_eval_src) root@16-cpu-128g-1gshared-exclgpu:/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT# find "/opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/asl_finetune_checkpoint_best/" -wholename "*samplespergloss*ase_chronological_bible_translation_in_american_sign_language_119_introductions_and_passages_cbt-001-ase-3-passage _ god creates the world.pose-mediapipe*seg_idx0*all_scores_EARTH_peaks_eval_stats_filtered.csv"|parallel "echo {} && head -n 2 {}" > EARTH_Dynamic_Results.txt
+
+
+or find /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/collecting_ai_results/avodah_annotated/ -name "*filtered.csv"|parallel "echo {} && head -n 2 {}" > /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/results/collecting_ai_results/avodah_annotated/Dynamic_Results.txt
+
+
+Then you run 
+
+
+
+
 # SignCLIP: Connecting Text and Sign Language by Contrastive Learning
 
 This document is a guideline for using the code and models and reproducing the findings introduced in our research paper:
