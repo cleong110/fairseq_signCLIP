@@ -129,7 +129,7 @@ def embed_with_sliding_window(
         partition_cols=["model", "window_size_ms"],
     )
 
-    logger.info(f"Saved {len(df)} new embeddings to dataset at {output_dir.resolve()}")
+    logger.info(f"Saved {len(df)} embeddings to dataset at {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
@@ -185,3 +185,24 @@ if __name__ == "__main__":
     # logger.info(f"Sample info: {existing_windows_sample.info()}")
     # for embed in existing_windows_sample["embedding"].to_list():
     #     logger.info(f"type: {type(embed)}: {embed.shape}")
+
+# cd /opt/home/cleong/projects/semantic-sign-language-search/setup_signCLIP/fairseq/examples/MMPT/
+# conda activate /opt/home/cleong/envs/signclip_inference/
+# Use 8 workers. Uses 1332MiB /  32768MiB on the V100, but also maxes out 16 CPUs. Takes about 250s/video
+# find /data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ -type f -name "*.pose"|parallel -j8 --progress python embed_with_sliding_window.py "{}" --window_size_ms 400 
+
+# On 40-cpu 1-gpu machine, about half usage of a V100 (90 to 160 of 250W, and 10630MiB /  32768MiB), and 97% CPU usage. Takes about 45s/video
+# find /data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/ -type f -name "*.pose"|parallel -j8 --progress python embed_with_sliding_window.py "{}" --window_size_ms 300 
+
+
+# Backing up:
+# lftp -u cleong1@udayton.edu ftps://ftp.box.com
+# cd /cleong1 workspace/data/DBL_Deaf_Bibles/signclip_embeddings_hive_format/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages
+# lcd /data/petabyte/cleong/data/DBL_Deaf_Bibles/webdataset_extracted/ase/chronological_bible_translation_in_american_sign_language_119_introductions_and_passages/
+# mirror -R \
+#   --verbose \
+#   --no-perms \
+#   --parallel=4 \
+#   --include-glob '*.parquet' \
+#   --exclude-glob '*.pose-mediapipe.window_embeddings.parquet' \
+#   . .
